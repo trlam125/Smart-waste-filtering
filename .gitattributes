@@ -1,0 +1,15 @@
+# Normalize text files across platforms.
+* text=auto eol=lf
+
+# Windows command scripts should keep CRLF in the working tree.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets: do not apply text normalization or text diffs.
+*.jpg binary
+*.jpeg binary
+*.png binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.db binary

@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="vi" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#061a14">
+  <meta name="description" content="Quét và phân loại rác thông minh bằng camera và AI - Bảo vệ môi trường">
+  <title>Waste Scanner AI - Phân loại rác thông minh</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+  <noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap" rel="stylesheet"></noscript>
+  <link rel="stylesheet" href="/static/styles.css?v=1.10.7">
+</head>
+<body>
+  <div class="bg-glow bg-glow-1"></div>
+  <div class="bg-glow bg-glow-2"></div>
+
+  <header class="topbar">
+    <a class="brand" href="#scanner" aria-label="Waste Scanner AI">
+      <div class="brand-mark-wrapper">
+        <span class="brand-mark">♻</span>
+        <span class="pulse-ring"></span>
+      </div>
+      <div class="brand-text">
+        <strong>Waste Scanner <span class="badge-ai">AI 2.0</span></strong>
+        <small>Phân loại rác thông minh</small>
+      </div>
+    </a>
+
+    <div class="topbar-actions">
+      <div id="aiStatus" class="status-indicator" data-state="checking" title="Đang kiểm tra trạng thái AI">
+        <span class="status-dot"></span>
+        <span id="aiStatusText" class="status-text">Đang kiểm tra AI</span>
+      </div>
+      <a href="#catalog" class="ghost-button hide-mobile">Tra cứu rác</a>
+      <button id="themeToggle" class="icon-button-sm" type="button" aria-label="Chuyển chế độ sáng/tối" title="Chuyển chế độ sáng/tối">🌙</button>
+      <button id="historyToggle" class="ghost-button badge-button" type="button">
+        <span>Nhật ký</span>
+        <span id="historyBadge" class="count-badge" hidden>0</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero" id="scanner">
+      <div class="hero-copy">
+        <div class="hero-badge">
+          <span class="sparkle">✨</span> Phân loại chuẩn xác với AI
+        </div>
+        <h1>Hướng camera vào vật thể rác</h1>
+        <p>Hệ thống tự động phân tích loại vật liệu, gợi ý đúng thùng rác và hướng dẫn tái chế chuẩn xác nhất.</p>
+
+        <div class="sample-chips-wrapper">
+          <span class="chips-label">Thử nhanh bằng ảnh minh họa:</span>
+          <div class="chips-list">
+            <button class="chip-btn" data-sample="plastic" type="button">🍾 Chai nhựa</button>
+            <button class="chip-btn" data-sample="paper" type="button">📦 Hộp bìa carton</button>
+            <button class="chip-btn" data-sample="metal" type="button">🥫 Lon nhôm</button>
+            <button class="chip-btn" data-sample="organic" type="button">🍎 Vỏ hoa quả</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="scanner-card" id="dropZone">
+        <div class="camera-shell">
+          <video id="camera" autoplay playsinline muted></video>
+          <img id="preview" alt="Xem trước ảnh rác đã chọn" hidden>
+          <canvas id="canvas" hidden></canvas>
+
+          <!-- HUD Camera Overlay -->
+          <div class="camera-hud">
+            <div class="hud-top">
+              <span class="hud-tag"><span class="rec-dot"></span> LIVE</span>
+              <span class="hud-tag">TARGET LOCK</span>
+            </div>
+            <div class="scan-guide" aria-hidden="true">
+              <span class="corner top-left"></span><span class="corner top-right"></span>
+              <span class="corner bottom-left"></span><span class="corner bottom-right"></span>
+              <div class="guide-crosshair"></div>
+              <div class="guide-label">Chỉ 1 vật thể · đặt giữa khung</div>
+            </div>
+            <div id="laserBeam" class="laser-beam" hidden></div>
+          </div>
+
+          <div id="cameraMessage" class="camera-message">Đang mở camera...</div>
+          
+          <div id="dropOverlay" class="drop-overlay">
+            <span class="drop-icon">📥</span>
+            <p>Thả ảnh rác vào đây để phân tích</p>
+          </div>
+
+          <div id="loading" class="loading" hidden aria-hidden="true" style="display: none;">
+            <div class="loading-visual">
+              <div class="spinner-ring"></div>
+              <span class="loading-icon">♻️</span>
+            </div>
+            <strong>AI đang phân tích hình ảnh...</strong>
+            <small>Đang nhận diện loại rác &amp; quy chuẩn thu gom</small>
+          </div>
+        </div>
+
+        <div class="camera-actions">
+          <button id="switchCamera" class="icon-button" type="button" title="Đổi camera trước/sau" aria-label="Đổi camera">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 10c0-4.418-3.582-8-8-8s-8 3.582-8 8m0 4c0 4.418 3.582 8 8 8s8-3.582 8-8"/><path d="m7 7-3 3 3 3M17 17l3-3-3-3"/></svg>
+          </button>
+          <button id="capture" class="capture-button" type="button">
+            <span class="shutter-core"></span>
+            <b>Quét ngay</b>
+          </button>
+          <button id="uploadButton" class="icon-button upload-button" type="button" title="Tải ảnh rác lên" aria-label="Tải ảnh lên">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          </button>
+          <input id="fileInput" type="file" accept="image/*" hidden>
+        </div>
+      </div>
+    </section>
+
+    <section id="resultSection" class="result-section" hidden aria-live="polite">
+      <div class="result-container">
+        <div class="section-title">
+          <div>
+            <p class="eyebrow">PHÂN TÍCH HOÀN TẤT</p>
+            <h2>Kết quả phân loại AI</h2>
+          </div>
+          <button id="scanAgain" class="btn-secondary" type="button">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/></svg>
+            Quét vật thể khác
+          </button>
+        </div>
+
+        <article class="result-card">
+          <div class="result-visual-col">
+            <div id="resultIcon" class="result-icon-glow">♻️</div>
+            
+            <!-- SVG Radial Gauge for Confidence Score -->
+            <div class="gauge-container">
+              <svg class="gauge-svg" viewBox="0 0 100 100">
+                <circle class="gauge-bg" cx="50" cy="50" r="42"/>
+                <circle id="gaugeProgress" class="gauge-progress" cx="50" cy="50" r="42" stroke-dasharray="264" stroke-dashoffset="264"/>
+              </svg>
+              <div class="gauge-text">
+                <strong id="resultConfidence">0%</strong>
+                <span>Mức phù hợp AI</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="result-main">
+            <div class="result-header-group">
+              <span id="resultCategory" class="category-badge">Đang tải...</span>
+              <h3 id="resultName" class="result-title">...</h3>
+            </div>
+
+            <div class="bin-card" id="binCard">
+              <div class="bin-icon-wrapper">
+                <span class="bin-symbol">🗑️</span>
+              </div>
+              <div class="bin-info">
+                <span class="bin-label">Thùng rác chỉ định</span>
+                <strong id="resultBin" class="bin-name">...</strong>
+              </div>
+            </div>
+
+            <div class="instruction-box">
+              <div class="instruction-title">
+                <span>💡</span> <strong>Quy trình xử lý &amp; Tái chế</strong>
+              </div>
+              <p id="resultInstruction"></p>
+            </div>
+
+            <div id="resultNotice" class="notice-banner"></div>
+
+            <div id="learningMemoryBadge" class="learning-memory-banner" hidden></div>
+
+            <section id="feedbackPanel" class="feedback-panel" aria-label="Phản hồi để AI học">
+              <div class="feedback-copy">
+                <strong>Giúp AI học từ lần quét này</strong>
+                <span id="feedbackStatus">Xác nhận hoặc sửa kết quả để AI học từ vật thể này.</span>
+                <span id="learningExampleCount" class="learning-example-count">Bộ nhớ học: 0 mẫu đã xác nhận</span>
+              </div>
+              <div class="feedback-actions">
+                <button id="feedbackCorrect" class="feedback-button feedback-correct" type="button">✓ Đúng</button>
+                <button id="feedbackFix" class="feedback-button" type="button">✎ Sửa kết quả</button>
+              </div>
+              <div id="feedbackCorrection" class="feedback-correction" hidden>
+                <label for="feedbackCategory">Loại rác đúng</label>
+                <div class="feedback-correction-row">
+                  <select id="feedbackCategory" class="feedback-select" aria-label="Chọn loại rác đúng"></select>
+                  <button id="feedbackSave" class="feedback-button feedback-save" type="button">Lưu &amp; học</button>
+                </div>
+              </div>
+            </section>
+
+            <details id="alternativesPanel" class="alternatives-panel">
+              <summary>
+                <span>Các khả năng dự đoán khác của AI</span>
+                <span class="arrow">▼</span>
+              </summary>
+              <div id="alternatives" class="alternatives-list"></div>
+            </details>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <!-- Waste Reference Catalog Section -->
+    <section class="catalog-section" id="catalog">
+      <div class="catalog-container">
+        <div class="section-title center">
+          <div>
+            <p class="eyebrow">DANH MỤC TRA CỨU</p>
+            <h2>Quy tắc phân loại rác chuẩn</h2>
+            <p class="section-subtitle">Tìm hiểu quy định phân loại 9 nhóm rác phổ biến để bảo vệ môi trường</p>
+          </div>
+        </div>
+
+        <div id="catalogGrid" class="catalog-grid">
+          <div class="catalog-loading">Đang tải danh mục phân loại rác...</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tips-section">
+      <div class="section-title">
+        <div>
+          <p class="eyebrow">MẸO QUÉT CHÍNH XÁC</p>
+          <h2>Tối ưu hiệu quả nhận diện của AI</h2>
+        </div>
+      </div>
+      <div class="tips-grid">
+        <article class="tip-card">
+          <div class="tip-num">01</div>
+          <div class="tip-content">
+            <h3>Ánh sáng đầy đủ</h3>
+            <p>Tránh chụp trong bóng tối hoặc ngược sáng mạnh để AI hiển thị màu sắc và vân bề mặt chuẩn nhất.</p>
+          </div>
+        </article>
+        <article class="tip-card">
+          <div class="tip-num">02</div>
+          <div class="tip-content">
+            <h3>Đơn lẻ một vật thể</h3>
+            <p>Đặt duy nhất một món rác vào chính giữa khung hình, hạn chế nền nhà rối hoặc nhiều vật chồng chéo.</p>
+          </div>
+        </article>
+        <article class="tip-card">
+          <div class="tip-num">03</div>
+          <div class="tip-content">
+            <h3>Góc chụp cận cảnh</h3>
+            <p>Tiến gần vật thể sao cho rác chiếm 60-80% khung hình. AI tự kiểm tra ảnh xoay dọc/ngang, nhưng vẫn nên giữ trọn vật thể gần tâm khung.</p>
+          </div>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <aside id="historyDrawer" class="drawer" aria-hidden="true">
+    <div class="drawer-backdrop" data-close-drawer></div>
+    <div class="drawer-panel">
+      <div class="drawer-header">
+        <div>
+          <p class="eyebrow">LỊCH SỬ SỬ DỤNG</p>
+          <h2>Nhật ký quét rác</h2>
+        </div>
+        <button class="close-button" data-close-drawer type="button" aria-label="Đóng nhật ký">×</button>
+      </div>
+
+      <!-- History Statistics Summary -->
+      <div class="history-stats">
+        <div class="stat-box">
+          <strong id="statTotal">0</strong>
+          <span>Lần quét</span>
+        </div>
+        <div class="stat-box">
+          <strong id="statRecycled">0</strong>
+          <span>Có thể tái chế</span>
+        </div>
+        <div class="stat-box">
+          <strong id="statConfidence">0%</strong>
+          <span>Phù hợp AI TB</span>
+        </div>
+      </div>
+
+      <!-- History Search & Filter -->
+      <div class="history-controls">
+        <input id="historySearch" type="search" placeholder="Tìm kiếm rác đã quét..." class="history-search-input">
+      </div>
+
+      <div id="historyList" class="history-list"></div>
+      <button id="loadMoreHistory" class="history-load-more" type="button" hidden>Tải thêm lịch sử</button>
+
+      <div class="drawer-footer">
+        <button id="clearHistory" class="danger-button" type="button">Xóa toàn bộ lịch sử</button>
+      </div>
+    </div>
+  </aside>
+
+  <div id="historyEditModal" class="history-edit-modal" hidden aria-hidden="true">
+    <div class="history-edit-backdrop" data-close-history-edit></div>
+    <section class="history-edit-card" role="dialog" aria-modal="true" aria-labelledby="historyEditTitle">
+      <div class="history-edit-header">
+        <div>
+          <p class="eyebrow">CHI TIẾT LẦN QUÉT</p>
+          <h2 id="historyEditTitle">Xem và sửa nhãn</h2>
+        </div>
+        <button class="close-button" data-close-history-edit type="button" aria-label="Đóng chi tiết">×</button>
+      </div>
+
+      <div class="history-edit-body">
+        <div class="history-edit-image-wrap">
+          <img id="historyEditImage" class="history-edit-image" alt="Ảnh vật thể của lần quét" hidden>
+          <div id="historyEditImagePlaceholder" class="history-edit-image-placeholder">Ảnh cũ không có thumbnail</div>
+        </div>
+
+        <div class="history-edit-details">
+          <strong id="historyEditObjectName" class="history-edit-object-name">...</strong>
+          <div class="history-edit-meta-grid">
+            <span>AI dự đoán ban đầu</span><strong id="historyEditPredicted">...</strong>
+            <span>Độ phù hợp AI</span><strong id="historyEditConfidence">...</strong>
+            <span>Thời gian</span><strong id="historyEditTime">...</strong>
+            <span>Nhãn đang dùng để học</span><strong id="historyEditCurrentLabel">Chưa xác nhận</strong>
+          </div>
+
+          <label class="history-edit-label" for="historyEditCategory">Sửa nhãn đúng</label>
+          <select id="historyEditCategory" class="feedback-select" aria-label="Chọn lại loại rác đúng"></select>
+          <p id="historyEditStatus" class="history-edit-status">Chọn nhãn đúng rồi lưu. Bạn có thể sửa lại nhiều lần.</p>
+          <div class="history-edit-actions">
+            <button id="historyEditDelete" class="history-modal-delete-button" type="button">Xóa lần quét này</button>
+            <button id="historyEditSave" class="feedback-button feedback-save history-edit-save" type="button">Lưu thay đổi &amp; cập nhật bộ nhớ học</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script src="/static/app.js?v=1.10.6" defer></script>
+</body>
+</html>
+

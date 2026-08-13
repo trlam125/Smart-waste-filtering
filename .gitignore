@@ -1,0 +1,36 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test / coverage
+.coverage
+.coverage.*
+htmlcov/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+data/
+*.db-journal
+*.db-wal
+*.db-shm
+*.log
+
+# Build / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
