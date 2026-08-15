@@ -14,18 +14,28 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.paths import (  # noqa: E402
+    ood_reference_path,
+    resolve_project_path,
+    torch_home,
+    training_output_dir,
+)
+
+os.environ["TORCH_HOME"] = str(torch_home())
+
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 from app.class_schema import WASTE_CLASS_KEYS  # noqa: E402
 from training.dataset_utils import DEFAULT_DATASET_SOURCE, prepare_dataset  # noqa: E402
+from training.build_ood_reference import build_ood_reference  # noqa: E402
 from app.model_factory import (  # noqa: E402
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -120,7 +130,10 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=Path,
         default=None,
-        help="Directory for checkpoints and metrics. Default: runs/<arch>.",
+        help=(
+            "Directory for checkpoints and metrics. On Colab the default is "
+            "/content/smart_waste_scanner_runtime/training/<arch>; elsewhere runs/<arch>."
+        ),
     )
     parser.add_argument(
         "--deploy",
@@ -136,7 +149,7 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if args.output is None:
-        args.output = Path("runs") / args.arch
+        args.output = training_output_dir(args.arch)
     return args
 
 
@@ -575,8 +588,8 @@ def main() -> int:
     seed_everything(args.seed)
     device = resolve_device(args.device)
     data_root = resolve_dataset_root(args.data)
-    output_dir = (PROJECT_ROOT / args.output).resolve() if not args.output.is_absolute() else args.output.resolve()
-    deploy_path = (PROJECT_ROOT / args.deploy).resolve() if not args.deploy.is_absolute() else args.deploy.resolve()
+    output_dir = resolve_project_path(args.output)
+    deploy_path = resolve_project_path(args.deploy)
     output_dir.mkdir(parents=True, exist_ok=True)
     deploy_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -610,8 +623,7 @@ def main() -> int:
     history: list[dict[str, Any]] = []
     resume_checkpoint: dict[str, Any] | None = None
     if args.resume is not None:
-        resume_path = args.resume if args.resume.is_absolute() else (PROJECT_ROOT / args.resume)
-        resume_path = resume_path.resolve()
+        resume_path = resolve_project_path(args.resume)
         (
             start_epoch,
             best_val_macro_f1,
@@ -814,9 +826,32 @@ def main() -> int:
     save_json(output_dir / "training_summary.json", summary)
 
     shutil.copy2(best_path, deploy_path)
+    deploy_ood_reference_path = ood_reference_path()
+    # The deployed app refuses to silently use an OOD bank from another checkpoint.
+    # Rebuild the persistent bank whenever training publishes a new deploy model.
+    model.to("cpu")
+    # Release training-only GPU state before constructing the deploy-time OOD
+    # feature extractor; otherwise a second model can needlessly compete with
+    # optimizer/scaler tensors for VRAM on smaller GPUs.
+    del model
+    del optimizer
+    if scaler is not None:
+        del scaler
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    ood_summary = build_ood_reference(
+        data_root,
+        deploy_path,
+        deploy_ood_reference_path,
+        batch_size=max(8, args.batch_size),
+        device_preference=args.device,
+    )
+    summary["ood_reference"] = ood_summary
+    save_json(output_dir / "training_summary.json", summary)
     print("\nTraining complete")
     print(f"Best checkpoint: {best_path}")
     print(f"Deploy checkpoint: {deploy_path}")
+    print(f"OOD reference (persistent): {deploy_ood_reference_path}")
     print(
         f"Test: accuracy={test_metrics['accuracy']:.4f} "
         f"macro_f1={test_metrics['macro_f1']:.4f}"

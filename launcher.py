@@ -17,10 +17,42 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+LAUNCHER_BUILD = "2026-08-15-status-v2"
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_PATH = ROOT_DIR / ".env"
 EXAMPLE_ENV_PATH = ROOT_DIR / ".env.example"
 load_dotenv(ENV_PATH)
+
+
+_LAUNCH_STARTED_AT = time.monotonic()
+
+
+def _running_in_colab() -> bool:
+    return bool(
+        os.getenv("COLAB_RELEASE_TAG")
+        or os.getenv("COLAB_GPU")
+        or os.getenv("COLAB_BACKEND_VERSION")
+    )
+
+
+def _log(message: str, *, prefix: str = "Waste Scanner") -> None:
+    elapsed = time.monotonic() - _LAUNCH_STARTED_AT
+    print(f"[{prefix}] +{elapsed:6.1f}s | {message}", flush=True)
+
+
+def _startup_timeout_default() -> int:
+    raw = os.getenv("STARTUP_TIMEOUT_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value >= 30:
+            return value
+    # A fresh Colab session may need to read the checkpoint from Drive and,
+    # when the persistent OOD bank is missing/stale, build it once from the
+    # extracted dataset. Give that first startup enough time.
+    return 600 if _running_in_colab() else 180
 
 
 def _set_env_value(lines: list[str], key: str, value: str) -> list[str]:
@@ -182,6 +214,7 @@ def kill_port_listener(port: int) -> int:
 def start_server(port: int, reload_enabled: bool, launch_token: str) -> subprocess.Popen[bytes]:
     command = [
         sys.executable,
+        "-u",
         "-m",
         "uvicorn",
         "app.main:app",
@@ -189,12 +222,17 @@ def start_server(port: int, reload_enabled: bool, launch_token: str) -> subproce
         "0.0.0.0",
         "--port",
         str(port),
+        "--log-level",
+        "info",
     ]
     if reload_enabled:
         command.extend(["--reload", "--reload-dir", str(ROOT_DIR / "app")])
     child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
     child_env["WASTE_SCANNER_LAUNCH_TOKEN"] = launch_token
-    return subprocess.Popen(command, cwd=ROOT_DIR, env=child_env, **_popen_kwargs())
+    process = subprocess.Popen(command, cwd=ROOT_DIR, env=child_env, **_popen_kwargs())
+    _log(f"Uvicorn process da tao (PID={process.pid}, port={port}).")
+    return process
 
 
 def stop_process_tree(process: subprocess.Popen[bytes] | None) -> None:
@@ -250,8 +288,16 @@ def wait_for_server(
 ) -> dict[str, object]:
     endpoint = "/api/ready" if require_ready else "/api/health"
     url = f"http://127.0.0.1:{port}{endpoint}"
-    deadline = time.monotonic() + timeout_seconds
+    started_at = time.monotonic()
+    deadline = started_at + timeout_seconds
     last_error = ""
+    last_state = ""
+    last_progress_log = 0.0
+    http_seen = False
+
+    target = "AI model" if require_ready else "FastAPI"
+    _log(f"Dang doi {target} san sang (timeout={timeout_seconds}s)...")
+
     while time.monotonic() < deadline:
         if process is not None:
             return_code = process.poll()
@@ -282,7 +328,14 @@ def wait_for_server(
         ) as exc:
             last_error = str(exc)
 
+        now = time.monotonic()
+        elapsed = now - started_at
+
         if payload is not None:
+            if not http_seen:
+                http_seen = True
+                _log(f"FastAPI da phan hoi tai http://127.0.0.1:{port}.")
+
             if payload.get("app") != "waste-scanner-ai":
                 last_error = "Port dang tra ve mot server khac, khong phai Waste Scanner AI."
             else:
@@ -293,20 +346,60 @@ def wait_for_server(
                         last_error = "Port dang tra ve mot instance Waste Scanner khac."
                     else:
                         last_error = "Port dang tra ve mot server cu/khac khong co launch token."
-                elif require_ready and not bool(payload.get("ready")):
-                    classifier = payload.get("classifier")
-                    classifier_state = (
-                        str(classifier.get("state", "")) if isinstance(classifier, dict) else ""
-                    )
-                    classifier_error = (
-                        str(classifier.get("error", "")) if isinstance(classifier, dict) else ""
-                    )
-                    if classifier_state in {"error", "retry_available"}:
-                        detail = f": {classifier_error}" if classifier_error else ""
-                        raise RuntimeError(f"Model AI khong san sang{detail}")
-                    last_error = f"Model AI dang khoi dong (state={classifier_state or 'unknown'})."
                 else:
-                    return payload
+                    classifier = payload.get("classifier")
+                    classifier_dict = classifier if isinstance(classifier, dict) else {}
+                    classifier_state = str(classifier_dict.get("state", ""))
+                    classifier_error = str(classifier_dict.get("error", ""))
+
+                    if classifier_state != last_state:
+                        last_state = classifier_state
+                        if classifier_state == "not_loaded":
+                            _log("FastAPI online; dang cho tac vu preload AI bat dau...")
+                        elif classifier_state == "loading":
+                            checkpoint = classifier_dict.get("checkpoint")
+                            ood_ref = classifier_dict.get("ood_reference")
+                            _log("AI dang load checkpoint/OOD reference...")
+                            if checkpoint:
+                                _log(f"Checkpoint: {checkpoint}")
+                            if ood_ref:
+                                _log(f"OOD reference: {ood_ref}")
+                        elif classifier_state == "ready":
+                            architecture = classifier_dict.get("architecture") or "unknown"
+                            device = classifier_dict.get("device") or "unknown"
+                            image_size = classifier_dict.get("image_size") or "?"
+                            _log(
+                                f"AI READY | arch={architecture} | device={device} | image_size={image_size}"
+                            )
+                        elif classifier_state in {"error", "retry_available"}:
+                            detail = f": {classifier_error}" if classifier_error else ""
+                            _log(f"AI load loi ({classifier_state}){detail}", prefix="ERROR")
+
+                    if require_ready and not bool(payload.get("ready")):
+                        if classifier_state in {"error", "retry_available"}:
+                            detail = f": {classifier_error}" if classifier_error else ""
+                            raise RuntimeError(f"Model AI khong san sang{detail}")
+                        last_error = f"Model AI dang khoi dong (state={classifier_state or 'unknown'})."
+
+                        # Keep Colab visibly alive during long Drive/OOD work.
+                        if now - last_progress_log >= 10.0:
+                            remaining = max(0, int(deadline - now))
+                            _log(
+                                f"Van dang khoi dong AI... {elapsed:.0f}s da troi qua, "
+                                f"con toi da {remaining}s."
+                            )
+                            last_progress_log = now
+                    else:
+                        return payload
+
+        elif now - last_progress_log >= 5.0:
+            remaining = max(0, int(deadline - now))
+            detail = f" | last={last_error}" if last_error else ""
+            _log(
+                f"Dang cho FastAPI phan hoi... {elapsed:.0f}s da troi qua, "
+                f"con toi da {remaining}s{detail}"
+            )
+            last_progress_log = now
 
         time.sleep(0.5)
 
@@ -396,7 +489,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Dong tien trinh dang LISTEN tren --port (Windows) va thoat.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--startup-timeout",
+        type=int,
+        default=_startup_timeout_default(),
+        help=(
+            "So giay toi da doi AI model san sang. "
+            "Mac dinh 600s tren Colab, 180s o local, hoac STARTUP_TIMEOUT_SECONDS trong .env."
+        ),
+    )
+    args = parser.parse_args()
+    if args.startup_timeout < 30:
+        parser.error("--startup-timeout phai >= 30 giay.")
+    return args
 
 
 def run_local(port: int, reload_enabled: bool) -> int:
@@ -432,7 +537,13 @@ def run_local(port: int, reload_enabled: bool) -> int:
         print("Da dong server va cac tien trinh con.")
 
 
-def run_ngrok(port: int, reload_enabled: bool, no_server: bool, open_browser: bool) -> int:
+def run_ngrok(
+    port: int,
+    reload_enabled: bool,
+    no_server: bool,
+    open_browser: bool,
+    startup_timeout: int,
+) -> int:
     server: subprocess.Popen[bytes] | None = None
     tunnel = None
     ngrok_client = None
@@ -448,24 +559,36 @@ def run_ngrok(port: int, reload_enabled: bool, no_server: bool, open_browser: bo
         if not no_server:
             require_free_port(port)
             launch_token = uuid.uuid4().hex
-            print(f"[Waste Scanner] Khoi dong FastAPI tai http://127.0.0.1:{port}")
+            _log(f"Khoi dong FastAPI tai http://127.0.0.1:{port}")
             server = start_server(port, reload_enabled, launch_token)
-            wait_for_server(port, launch_token, process=server, require_ready=True)
+            wait_for_server(
+                port,
+                launch_token,
+                timeout_seconds=startup_timeout,
+                process=server,
+                require_ready=True,
+            )
         else:
-            print(f"[Waste Scanner] Kiem tra server co san tai http://127.0.0.1:{port}")
-            wait_for_server(port, expected_token=None, timeout_seconds=90, require_ready=True)
+            _log(f"Kiem tra server co san tai http://127.0.0.1:{port}")
+            wait_for_server(
+                port,
+                expected_token=None,
+                timeout_seconds=startup_timeout,
+                require_ready=True,
+            )
 
-        print("[ngrok] Dang tao HTTPS tunnel...")
+        _log("AI san sang. Dang tao HTTPS tunnel...", prefix="ngrok")
         ngrok_client, tunnel = build_tunnel(port)
         public_url = tunnel.public_url
 
-        print("\n" + "=" * 64)
-        print("WASTE SCANNER AI DA ONLINE")
-        print(f"Public URL : {public_url}")
-        print(f"Local URL  : http://127.0.0.1:{port}")
-        print("Inspector  : http://127.0.0.1:4040")
-        print("Nhan Ctrl+C de dung server va tunnel.")
-        print("=" * 64 + "\n")
+        print("\n" + "=" * 72, flush=True)
+        print("WASTE SCANNER AI DA ONLINE", flush=True)
+        print(f"PUBLIC URL : {public_url}", flush=True)
+        print(f"LOCAL URL  : http://127.0.0.1:{port}", flush=True)
+        print("INSPECTOR  : http://127.0.0.1:4040", flush=True)
+        print("STATUS     : FastAPI + AI model + ngrok READY", flush=True)
+        print("Nhan Stop cell / Ctrl+C de dung server va tunnel.", flush=True)
+        print("=" * 72 + "\n", flush=True)
 
         if open_browser:
             webbrowser.open(public_url)
@@ -499,13 +622,33 @@ def run_ngrok(port: int, reload_enabled: bool, no_server: bool, open_browser: bo
 
 
 def main() -> int:
+    # Force immediate notebook-visible output before any startup checks.
+    try:
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+        sys.stderr.reconfigure(line_buffering=True, write_through=True)
+    except (AttributeError, ValueError):
+        pass
+    print("=" * 72, flush=True)
+    print(f"WASTE SCANNER LAUNCHER | build={LAUNCHER_BUILD}", flush=True)
+    print(f"Python     : {sys.executable}", flush=True)
+    print(f"Project    : {ROOT_DIR}", flush=True)
+    print(f"Colab      : {_running_in_colab()}", flush=True)
+    print("=" * 72, flush=True)
+    _log("Launcher da bat dau. Dang doc tham so khoi dong...")
     args = parse_args()
+    _log(f"Tham so: ngrok={args.ngrok}, port={args.port}, reload={args.reload}, timeout={args.startup_timeout}s")
     if args.kill_port:
         return kill_port_listener(args.port)
     if args.configure:
         return configure_ngrok()
     if args.ngrok:
-        return run_ngrok(args.port, args.reload, args.no_server, args.open)
+        return run_ngrok(
+            args.port,
+            args.reload,
+            args.no_server,
+            args.open,
+            args.startup_timeout,
+        )
     if args.no_server or args.open:
         print("--no-server va --open chi dung kem --ngrok.", file=sys.stderr)
         return 2

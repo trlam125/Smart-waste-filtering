@@ -20,7 +20,8 @@ from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from .paths import PROJECT_ROOT, collection_pending_dir, resolve_project_path
+
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from .classifier import ModelUnavailableError, WasteClassifier
@@ -98,11 +99,13 @@ CLASSIFIER_IMAGE_MAX_DIMENSION = _positive_int_env("CLASSIFIER_IMAGE_MAX_DIMENSI
 THUMBNAIL_MAX_DIMENSION = _positive_int_env("THUMBNAIL_MAX_DIMENSION", 480)
 THUMBNAIL_JPEG_QUALITY = _bounded_int_env("THUMBNAIL_JPEG_QUALITY", 80, 40, 95)
 HISTORY_DELETE_PASSWORD = os.getenv("HISTORY_DELETE_PASSWORD", "").strip()
+def _project_managed_path(raw_value: str, default: Path) -> Path:
+    return resolve_project_path(raw_value or default)
+
+
 _SCAN_THUMBNAIL_DIR_ENV = os.getenv("SCAN_THUMBNAIL_DIR", "").strip()
-SCAN_THUMBNAIL_DIR = (
-    Path(_SCAN_THUMBNAIL_DIR_ENV).expanduser()
-    if _SCAN_THUMBNAIL_DIR_ENV
-    else DB_PATH.parent / "scans"
+SCAN_THUMBNAIL_DIR = _project_managed_path(
+    _SCAN_THUMBNAIL_DIR_ENV, PROJECT_ROOT / "data" / "scans"
 )
 
 # Real-world dataset collection. A high-quality, EXIF-corrected JPEG is staged
@@ -111,30 +114,27 @@ SCAN_THUMBNAIL_DIR = (
 DATASET_COLLECTION_ENABLED = _bool_env("DATASET_COLLECTION_ENABLED", True)
 COLLECTED_IMAGE_MAX_DIMENSION = _positive_int_env("COLLECTED_IMAGE_MAX_DIMENSION", 1600)
 COLLECTED_JPEG_QUALITY = _bounded_int_env("COLLECTED_JPEG_QUALITY", 92, 70, 98)
-_COLLECTED_DATA_DIR_ENV = os.getenv("COLLECTED_DATA_DIR", "").strip()
-_default_collected_dir = DB_PATH.parent / "collected"
-if not _default_collected_dir.is_absolute():
-    _default_collected_dir = PROJECT_ROOT / _default_collected_dir
-COLLECTED_DATA_DIR = (
-    Path(_COLLECTED_DATA_DIR_ENV).expanduser()
-    if _COLLECTED_DATA_DIR_ENV
-    else _default_collected_dir
+MAX_COLLECTION_IMAGE_BYTES = _positive_int_env(
+    "MAX_COLLECTION_IMAGE_BYTES", 16 * 1024 * 1024
 )
-if not COLLECTED_DATA_DIR.is_absolute():
-    COLLECTED_DATA_DIR = PROJECT_ROOT / COLLECTED_DATA_DIR
-COLLECTED_PENDING_DIR = COLLECTED_DATA_DIR / "_pending"
+_COLLECTED_DATA_DIR_ENV = os.getenv("COLLECTED_DATA_DIR", "").strip()
+COLLECTED_DATA_DIR = _project_managed_path(
+    _COLLECTED_DATA_DIR_ENV, PROJECT_ROOT / "data" / "collected"
+)
+COLLECTED_PENDING_DIR = collection_pending_dir(COLLECTED_DATA_DIR)
 COLLECTED_METADATA_PATH = COLLECTED_DATA_DIR / "metadata.csv"
 
 
 def _require_history_delete_password(candidate: str | None) -> None:
-    if not HISTORY_DELETE_PASSWORD:
-        raise HTTPException(
-            status_code=503,
-            detail="Chức năng xóa đang bị khóa vì HISTORY_DELETE_PASSWORD chưa được cấu hình trong .env.",
-        )
+    # Do not expose whether the delete password is configured. Missing, blank,
+    # and incorrect credentials intentionally share the same public response.
     supplied = (candidate or "").strip()
-    if not supplied or not hmac.compare_digest(supplied, HISTORY_DELETE_PASSWORD):
-        raise HTTPException(status_code=401, detail="Mật khẩu xóa không đúng.")
+    if (
+        not HISTORY_DELETE_PASSWORD
+        or not supplied
+        or not hmac.compare_digest(supplied, HISTORY_DELETE_PASSWORD)
+    ):
+        raise HTTPException(status_code=401, detail="Không đúng mật khẩu.")
 classifier = WasteClassifier()
 # Gate requests before they enter Starlette's shared threadpool. The classifier
 # still keeps its internal threading lock as a second line of protection.
@@ -185,6 +185,39 @@ def _save_scan_thumbnail(scan_id: int, client_id: str, image: Image.Image) -> bo
         temporary.unlink(missing_ok=True)
         target.unlink(missing_ok=True)
         return False
+
+
+def _decode_supported_image(content: bytes, *, label: str) -> Image.Image:
+    """Validate an uploaded image and return an EXIF-corrected RGB copy."""
+    if not content:
+        raise HTTPException(status_code=400, detail=f"{label} rỗng.")
+    try:
+        with Image.open(io.BytesIO(content)) as source:
+            image_format = (source.format or "").upper()
+            if image_format not in {"JPEG", "PNG", "WEBP"}:
+                raise HTTPException(
+                    status_code=415,
+                    detail=f"{label} chỉ hỗ trợ JPEG, PNG hoặc WebP.",
+                )
+            width, height = source.size
+            if width <= 0 or height <= 0:
+                raise HTTPException(status_code=400, detail=f"{label} có kích thước không hợp lệ.")
+            if width * height > MAX_IMAGE_PIXELS:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"{label} có độ phân giải quá lớn. "
+                        f"Giới hạn là {MAX_IMAGE_PIXELS:,} pixel."
+                    ),
+                )
+            source.verify()
+
+        with Image.open(io.BytesIO(content)) as source:
+            return ImageOps.exif_transpose(source).convert("RGB")
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
+        raise HTTPException(status_code=400, detail=f"{label} không phải ảnh hợp lệ.") from exc
 
 
 def _save_pending_collection_image(scan_id: int, image: Image.Image) -> bool:
@@ -346,6 +379,89 @@ def _delete_all_pending_collection_images() -> int:
     return deleted
 
 
+def _remove_collection_metadata(scan_id: int | None = None) -> int:
+    """Remove one scan row, or all rows, from collection metadata."""
+    if not COLLECTED_METADATA_PATH.is_file():
+        return 0
+    if scan_id is None:
+        try:
+            with COLLECTED_METADATA_PATH.open("r", encoding="utf-8", newline="") as handle:
+                removed = sum(1 for _ in csv.DictReader(handle))
+            COLLECTED_METADATA_PATH.unlink(missing_ok=True)
+            return removed
+        except OSError:
+            logger.warning("Could not clear collection metadata", exc_info=True)
+            return 0
+
+    fields = ("scan_id", "image_path", "label", "predicted_key", "is_correct", "updated_at")
+    kept: list[dict[str, str]] = []
+    removed = 0
+    try:
+        with COLLECTED_METADATA_PATH.open("r", encoding="utf-8", newline="") as handle:
+            for row in csv.DictReader(handle):
+                try:
+                    row_id = int(row.get("scan_id", ""))
+                except (TypeError, ValueError):
+                    kept.append({field: str(row.get(field, "")) for field in fields})
+                    continue
+                if row_id == scan_id:
+                    removed += 1
+                else:
+                    kept.append({field: str(row.get(field, "")) for field in fields})
+
+        temporary = COLLECTED_DATA_DIR / f".metadata_delete_{os.getpid()}.tmp"
+        if kept:
+            COLLECTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with temporary.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows(kept)
+            temporary.replace(COLLECTED_METADATA_PATH)
+        else:
+            temporary.unlink(missing_ok=True)
+            COLLECTED_METADATA_PATH.unlink(missing_ok=True)
+        return removed
+    except OSError:
+        logger.warning("Could not update collection metadata during delete", exc_info=True)
+        return 0
+
+
+def _delete_collection_sample(scan_id: int) -> dict[str, int]:
+    deleted_images = _delete_pending_collection_image(scan_id)
+    for path in _collection_sample_candidates(scan_id):
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                deleted_images += 1
+        except OSError:
+            logger.warning("Could not delete collected dataset image: %s", path, exc_info=True)
+    return {
+        "images_deleted": deleted_images,
+        "metadata_rows_deleted": _remove_collection_metadata(scan_id),
+    }
+
+
+def _delete_all_collection_samples() -> dict[str, int]:
+    deleted_images = _delete_all_pending_collection_images()
+    for key in RULE_BY_KEY:
+        directory = COLLECTED_DATA_DIR / key
+        try:
+            candidates = list(directory.glob("scan_*.jpg"))
+        except OSError:
+            continue
+        for path in candidates:
+            try:
+                if path.is_file() or path.is_symlink():
+                    path.unlink()
+                    deleted_images += 1
+            except OSError:
+                logger.warning("Could not delete collected dataset image: %s", path, exc_info=True)
+    return {
+        "images_deleted": deleted_images,
+        "metadata_rows_deleted": _remove_collection_metadata(None),
+    }
+
+
 def _thumbnail_path(filename: str) -> Path | None:
     if not filename or Path(filename).name != filename:
         return None
@@ -467,6 +583,7 @@ def _service_status_payload() -> dict[str, Any]:
         "dataset_collection": {
             "enabled": DATASET_COLLECTION_ENABLED,
             "directory": str(COLLECTED_DATA_DIR),
+            "pending_directory": str(COLLECTED_PENDING_DIR),
         },
     }
 
@@ -492,6 +609,10 @@ def categories() -> list[dict[str, str]]:
 @app.post("/api/classify")
 async def classify_image(
     image: Annotated[UploadFile, File(description="Ảnh chụp từ camera")],
+    collection_image: Annotated[
+        UploadFile | None,
+        File(description="Ảnh chất lượng cao tùy chọn để lưu sau khi người dùng xác nhận nhãn"),
+    ] = None,
     client_id: Annotated[str | None, Header(alias="X-Client-ID", max_length=128)] = None,
 ) -> dict[str, Any]:
     history_scope = _normalize_client_id(client_id)
@@ -506,40 +627,36 @@ async def classify_image(
         raise HTTPException(status_code=400, detail="Ảnh rỗng.")
     if len(content) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="Ảnh vượt quá giới hạn 8 MB.")
+    primary_full_image = _decode_supported_image(content, label="Ảnh phân loại")
+    pil_image = primary_full_image.copy()
+    pil_image.thumbnail(
+        (CLASSIFIER_IMAGE_MAX_DIMENSION, CLASSIFIER_IMAGE_MAX_DIMENSION),
+        Image.Resampling.LANCZOS,
+    )
 
-    try:
-        with Image.open(io.BytesIO(content)) as source:
-            image_format = (source.format or "").upper()
-            if image_format not in {"JPEG", "PNG", "WEBP"}:
-                raise HTTPException(
-                    status_code=415,
-                    detail="Chỉ hỗ trợ ảnh JPEG, PNG hoặc WebP.",
-                )
-
-            width, height = source.size
-            if width <= 0 or height <= 0:
-                raise HTTPException(status_code=400, detail="Ảnh có kích thước không hợp lệ.")
-            if width * height > MAX_IMAGE_PIXELS:
+    # The UI may send a second, less-compressed/larger image exclusively for
+    # confirmed dataset collection. Failure of that optional payload must not
+    # block classification; fall back to the validated inference upload.
+    collection_source_image = primary_full_image
+    collection_source = "inference_upload"
+    if collection_image is not None and DATASET_COLLECTION_ENABLED:
+        try:
+            collection_content = await collection_image.read(MAX_COLLECTION_IMAGE_BYTES + 1)
+            if len(collection_content) > MAX_COLLECTION_IMAGE_BYTES:
                 raise HTTPException(
                     status_code=413,
                     detail=(
-                        "Ảnh có độ phân giải quá lớn. "
-                        f"Giới hạn là {MAX_IMAGE_PIXELS:,} pixel."
+                        "Ảnh lưu dataset vượt quá giới hạn "
+                        f"{MAX_COLLECTION_IMAGE_BYTES // (1024 * 1024)} MB."
                     ),
                 )
-            source.verify()
-
-        with Image.open(io.BytesIO(content)) as source:
-            collection_image = ImageOps.exif_transpose(source).convert("RGB")
-            pil_image = collection_image.copy()
-            pil_image.thumbnail(
-                (CLASSIFIER_IMAGE_MAX_DIMENSION, CLASSIFIER_IMAGE_MAX_DIMENSION),
-                Image.Resampling.LANCZOS,
+            collection_source_image = _decode_supported_image(
+                collection_content,
+                label="Ảnh lưu dataset",
             )
-    except HTTPException:
-        raise
-    except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-        raise HTTPException(status_code=400, detail="Tệp tải lên không phải ảnh hợp lệ.") from exc
+            collection_source = "high_quality_upload"
+        except HTTPException as exc:
+            logger.warning("Ignoring optional collection image: %s", exc.detail)
 
     try:
         async with classification_gate:
@@ -610,7 +727,7 @@ async def classify_image(
                 collection_pending_stored = await run_in_threadpool(
                     _save_pending_collection_image,
                     scan_id,
-                    collection_image,
+                    collection_source_image,
                 )
             if LEARNING_ENABLED and result.embedding and result.embedding_kind:
                 try:
@@ -651,7 +768,7 @@ async def classify_image(
 
     if memory_applied:
         matched = int(memory_info.get("matched_examples", 0))
-        notice += f" Kết quả này đã tham khảo {matched} mẫu bạn từng xác nhận/sửa trước đó."
+        notice += f" Kết quả này đã tham khảo {matched} mẫu đã xác nhận trong bộ nhớ dùng chung."
 
     if not history_saved:
         notice += (
@@ -711,6 +828,7 @@ async def classify_image(
             "enabled": DATASET_COLLECTION_ENABLED,
             "pending": collection_pending_stored,
             "saved": False,
+            "source": collection_source if collection_pending_stored else None,
         },
         "notice": notice,
     }
@@ -865,15 +983,14 @@ async def delete_history_item(
         if linked_thumbnail:
             filenames.append(str(linked_thumbnail))
         thumbnails_deleted = await run_in_threadpool(_delete_thumbnail_files, filenames)
-        pending_dataset_images_deleted = await run_in_threadpool(
-            _delete_pending_collection_image, scan_id
-        )
+        collection_deleted = await run_in_threadpool(_delete_collection_sample, scan_id)
 
     return {
         "deleted": 1,
         "scan_id": scan_id,
         "thumbnails_deleted": thumbnails_deleted,
-        "pending_dataset_images_deleted": pending_dataset_images_deleted,
+        "dataset_images_deleted": int(collection_deleted["images_deleted"]),
+        "collection_metadata_rows_deleted": int(collection_deleted["metadata_rows_deleted"]),
         "remaining": int(deleted["remaining"]),
         "sequence_reset": False,
         "next_scan_id": None,
@@ -888,13 +1005,12 @@ async def delete_history(
     async with history_mutation_gate:
         deleted = await run_in_threadpool(clear_scans)
         thumbnails_deleted = await run_in_threadpool(_delete_all_managed_thumbnail_files)
-        pending_dataset_images_deleted = await run_in_threadpool(
-            _delete_all_pending_collection_images
-        )
+        collection_deleted = await run_in_threadpool(_delete_all_collection_samples)
     return {
         "deleted": deleted,
         "thumbnails_deleted": thumbnails_deleted,
-        "pending_dataset_images_deleted": pending_dataset_images_deleted,
+        "dataset_images_deleted": int(collection_deleted["images_deleted"]),
+        "collection_metadata_rows_deleted": int(collection_deleted["metadata_rows_deleted"]),
         "sequence_reset": False,
         "next_scan_id": None,
     }

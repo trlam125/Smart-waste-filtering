@@ -6,34 +6,20 @@ import shutil
 import zipfile
 from pathlib import Path, PurePosixPath
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+from app.paths import PROJECT_ROOT, dataset_extract_dir, resolve_project_path
+
+
+def _project_path(value: Path | str) -> Path:
+    """Backward-compatible helper: relative paths are anchored to PROJECT_ROOT."""
+    return resolve_project_path(value)
+
+
 DEFAULT_DATASET_SOURCE = PROJECT_ROOT / "data" / "dataset" / "dataset.zip"
 
 
-def _running_in_colab() -> bool:
-    """Return True when the code is running inside a Google Colab runtime."""
-    return (
-        "COLAB_RELEASE_TAG" in os.environ
-        or "COLAB_GPU" in os.environ
-        or (Path("/content").is_dir() and Path("/content/drive").exists())
-    )
-
-
 def _default_extract_dir() -> Path:
-    """
-    Keep extracted images off Google Drive when running in Colab.
-
-    - Colab: /content/smart_waste_scanner_dataset
-    - Local:  <project>/data/dataset/_extracted
-
-    SMARTWASTE_DATASET_EXTRACT_DIR can override both locations.
-    """
-    override = os.environ.get("SMARTWASTE_DATASET_EXTRACT_DIR")
-    if override:
-        return Path(override).expanduser()
-    if _running_in_colab():
-        return Path("/content/smart_waste_scanner_dataset")
-    return PROJECT_ROOT / "data" / "dataset" / "_extracted"
+    """Return the disposable extraction cache for the current runtime."""
+    return dataset_extract_dir()
 
 
 DEFAULT_EXTRACT_DIR = _default_extract_dir()
@@ -47,7 +33,7 @@ def _has_splits(path: Path) -> bool:
 
 def locate_dataset_root(path: Path) -> Path:
     """Return the directory that directly contains train/, val/ and test/."""
-    path = path.expanduser().resolve()
+    path = _project_path(path)
     if _has_splits(path):
         return path
 
@@ -106,8 +92,8 @@ def _validate_zip_members(archive: zipfile.ZipFile) -> None:
 
 
 def extract_dataset_zip(source: Path, extract_dir: Path = DEFAULT_EXTRACT_DIR) -> Path:
-    source = source.expanduser().resolve()
-    extract_dir = extract_dir.expanduser().resolve()
+    source = _project_path(source)
+    extract_dir = _project_path(extract_dir)
     if not source.is_file():
         raise FileNotFoundError(f"Dataset ZIP not found: {source}")
     if source.suffix.lower() != ".zip":
@@ -147,7 +133,7 @@ def extract_dataset_zip(source: Path, extract_dir: Path = DEFAULT_EXTRACT_DIR) -
 
 def prepare_dataset(source: Path | str = DEFAULT_DATASET_SOURCE) -> Path:
     """Accept either dataset.zip or an already-extracted dataset directory."""
-    path = Path(source).expanduser().resolve()
+    path = _project_path(source)
     if path.is_file():
         if path.suffix.lower() == ".zip":
             return extract_dataset_zip(path)

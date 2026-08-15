@@ -9,9 +9,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
+from .paths import PROJECT_ROOT, project_path_from_env
 from .waste_rules import LEARNABLE_RULE_KEYS, RULE_BY_KEY, WASTE_RULES
 
-DB_PATH = Path(os.getenv("DATABASE_PATH", "data/waste_scanner.db"))
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+
+
+def _project_path_from_env(name: str, default: str) -> Path:
+    return project_path_from_env(name, default)
+
+
+DB_PATH = _project_path_from_env("DATABASE_PATH", "data/waste_scanner.db")
 MAX_HISTORY_PAGE_SIZE = 100
 LEGACY_CLIENT_ID = "legacy"
 RECYCLABLE_KEYS = (

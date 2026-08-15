@@ -372,14 +372,197 @@ Then:
 
 ```python
 !python launcher.py --ngrok --port 8000
+```
 
-If you run the source code from `/content` instead of directly from Drive, point long-lived data back to Drive in `.env`, for example:
+Or run in 1 cell:
+```
+# ================================================================
+# SMART WASTE SCANNER
+# ================================================================
 
-```env
-DATABASE_PATH=/content/drive/MyDrive/Colab Notebooks/Smart waste scanner/data/waste_scanner.db
-SCAN_THUMBNAIL_DIR=/content/drive/MyDrive/Colab Notebooks/Smart waste scanner/data/scans
-COLLECTED_DATA_DIR=/content/drive/MyDrive/Colab Notebooks/Smart waste scanner/data/collected
-WASTE_MODEL_CHECKPOINT=/content/drive/MyDrive/Colab Notebooks/Smart waste scanner/models/best_model.pt
+from google.colab import drive
+from pathlib import Path
+import os
+import sys
+import subprocess
+import hashlib
+
+drive.mount("/content/drive")
+
+PROJECT_DIR = Path(
+    "/content/drive/MyDrive/Colab Notebooks/Smart waste scanner"
+).resolve()
+
+if not PROJECT_DIR.is_dir():
+    raise FileNotFoundError(
+        f"Không tìm thấy project: {PROJECT_DIR}"
+    )
+
+os.chdir(PROJECT_DIR)
+
+print("=" * 72, flush=True)
+print("SMART WASTE SCANNER - COLAB", flush=True)
+print("PROJECT:", PROJECT_DIR, flush=True)
+print("=" * 72, flush=True)
+
+launcher = PROJECT_DIR / "launcher.py"
+
+launcher_text = launcher.read_text(
+    encoding="utf-8",
+    errors="ignore",
+)
+
+EXPECTED = 'LAUNCHER_BUILD = "2026-08-15-status-v2"'
+
+if EXPECTED not in launcher_text:
+    raise RuntimeError(
+        "\n❌ launcher.py chưa phải bản status-v2.\n"
+        "Hãy dán đè launcher.py từ patch mới nhất rồi chạy lại."
+    )
+
+print("✅ Launcher build: 2026-08-15-status-v2", flush=True)
+
+required = [
+    PROJECT_DIR / "requirements.txt",
+    PROJECT_DIR / ".env",
+    PROJECT_DIR / "models" / "best_model.pt",
+    PROJECT_DIR / "data" / "dataset" / "dataset.zip",
+    PROJECT_DIR / "training" / "check_paths.py",
+]
+
+missing = [p for p in required if not p.exists()]
+
+if missing:
+    print("\n❌ Thiếu file:")
+    for p in missing:
+        print(" -", p)
+    raise RuntimeError("Project chưa đầy đủ.")
+
+print("✅ Các file bắt buộc đã có.", flush=True)
+
+requirements = PROJECT_DIR / "requirements.txt"
+
+req_hash = hashlib.sha256(
+    requirements.read_bytes()
+).hexdigest()
+
+marker = Path("/content/.smartwaste_requirements")
+
+need_install = True
+
+if marker.exists():
+    if marker.read_text().strip() == req_hash:
+        need_install = False
+
+if need_install:
+    print("\n📦 Đang cài dependencies...", flush=True)
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "-r",
+            "requirements.txt",
+        ],
+        cwd=str(PROJECT_DIR),
+        check=True,
+    )
+
+    marker.write_text(req_hash)
+
+    print("✅ Dependencies OK.", flush=True)
+
+else:
+    print("✅ Dependencies đã có, bỏ qua pip install.", flush=True)
+
+print("\n" + "=" * 72, flush=True)
+print("CHECK PATHS", flush=True)
+print("=" * 72, flush=True)
+
+result = subprocess.run(
+    [
+        sys.executable,
+        "-u",
+        "training/check_paths.py",
+    ],
+    cwd=str(PROJECT_DIR),
+)
+
+if result.returncode != 0:
+    raise RuntimeError(
+        "❌ Path configuration chưa đúng."
+    )
+
+print("✅ PATHS OK", flush=True)
+
+print("\n" + "=" * 72, flush=True)
+print("START SMART WASTE SCANNER", flush=True)
+print("=" * 72, flush=True)
+
+env = os.environ.copy()
+env["PYTHONUNBUFFERED"] = "1"
+
+process = subprocess.Popen(
+    [
+        sys.executable,
+        "-u",
+        "launcher.py",
+        "--ngrok",
+        "--port",
+        "8000",
+    ],
+    cwd=str(PROJECT_DIR),
+    env=env,
+
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+
+    text=True,
+    bufsize=1,
+)
+
+try:
+    while True:
+
+        line = process.stdout.readline()
+
+        if line:
+            print(line, end="", flush=True)
+
+        if process.poll() is not None:
+            # In nốt output còn lại
+            remaining = process.stdout.read()
+
+            if remaining:
+                print(remaining, end="", flush=True)
+
+            break
+
+except KeyboardInterrupt:
+
+    print(
+        "\n\n⏹ Đang dừng Waste Scanner...",
+        flush=True,
+    )
+
+    process.terminate()
+
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+    print("✅ Đã dừng.", flush=True)
+
+    raise
+
+if process.returncode not in (0, None):
+    raise RuntimeError(
+        f"Launcher kết thúc với code {process.returncode}"
+    )
 ```
 
 Synchronization between local and Colab

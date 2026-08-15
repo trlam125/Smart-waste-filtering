@@ -70,11 +70,14 @@ let historyEditItem = null;
 const historyThumbnailUrls = new Map();
 
 const HISTORY_PAGE_SIZE = 50;
-const CAMERA_TARGET_WIDTH = 960;
-const CAMERA_TARGET_HEIGHT = 720;
+const CAMERA_TARGET_WIDTH = 1920;
+const CAMERA_TARGET_HEIGHT = 1080;
 const MAX_PROCESSING_DIMENSION = 1024;
 const UPLOAD_OPTIMIZE_THRESHOLD_BYTES = 1.2 * 1024 * 1024;
 const JPEG_QUALITY = 0.82;
+const COLLECTION_MAX_DIMENSION = 1600;
+const COLLECTION_JPEG_QUALITY = 0.92;
+const COLLECTION_DIRECT_MAX_BYTES = 12 * 1024 * 1024;
 
 const CLIENT_ID_STORAGE_KEY = 'waste-scanner-client-id';
 const CLIENT_ID_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
@@ -474,8 +477,38 @@ async function optimizeUploadedImage(file) {
   }
 }
 
+async function prepareCollectionImage(file) {
+  const supportedDirectTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
+  let source;
+  try {
+    source = await loadImageBitmap(file);
+    const sourceWidth = source.width || source.naturalWidth;
+    const sourceHeight = source.height || source.naturalHeight;
+    if (!sourceWidth || !sourceHeight) throw new Error('Không đọc được kích thước ảnh.');
+
+    const size = scaledSize(sourceWidth, sourceHeight, COLLECTION_MAX_DIMENSION);
+    const canKeepOriginal = supportedDirectTypes.has(file.type)
+      && file.size <= COLLECTION_DIRECT_MAX_BYTES
+      && size.width === sourceWidth
+      && size.height === sourceHeight;
+    if (canKeepOriginal) return file;
+
+    const workCanvas = document.createElement('canvas');
+    workCanvas.width = size.width;
+    workCanvas.height = size.height;
+    const context = workCanvas.getContext('2d', { alpha: false });
+    context.drawImage(source, 0, 0, size.width, size.height);
+    return await canvasToBlob(workCanvas, 'image/jpeg', COLLECTION_JPEG_QUALITY);
+  } catch (error) {
+    if (supportedDirectTypes.has(file.type) && file.size <= COLLECTION_DIRECT_MAX_BYTES) return file;
+    throw new Error('Không thể chuẩn bị ảnh chất lượng cao để lưu dataset.');
+  } finally {
+    if (source?.close) source.close();
+  }
+}
+
 // --- Classification API Call ---
-async function requestClassification(blob) {
+async function requestClassification(blob, collectionBlob = null) {
   const requestId = ++requestSequence;
   activeRequestController?.abort();
   const controller = new AbortController();
@@ -483,6 +516,9 @@ async function requestClassification(blob) {
 
   const formData = new FormData();
   formData.append('image', blob, 'waste-scan.jpg');
+  if (collectionBlob && collectionBlob !== blob) {
+    formData.append('collection_image', collectionBlob, 'waste-scan-hq.jpg');
+  }
 
   try {
     const response = await fetch('/api/classify', {
@@ -535,15 +571,31 @@ async function captureFrame() {
   setBusy(true);
   let classificationSucceeded = false;
   try {
-    const size = scaledSize(video.videoWidth, video.videoHeight);
+    const collectionSize = scaledSize(
+      video.videoWidth,
+      video.videoHeight,
+      COLLECTION_MAX_DIMENSION
+    );
+    const collectionCanvas = document.createElement('canvas');
+    collectionCanvas.width = collectionSize.width;
+    collectionCanvas.height = collectionSize.height;
+    const collectionContext = collectionCanvas.getContext('2d', { alpha: false });
+    collectionContext.drawImage(video, 0, 0, collectionCanvas.width, collectionCanvas.height);
+    const collectionBlob = await canvasToBlob(
+      collectionCanvas,
+      'image/jpeg',
+      COLLECTION_JPEG_QUALITY
+    );
+
+    const size = scaledSize(collectionCanvas.width, collectionCanvas.height);
     canvas.width = size.width;
     canvas.height = size.height;
     const context = canvas.getContext('2d', { alpha: false });
-    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    context.drawImage(collectionCanvas, 0, 0, canvas.width, canvas.height);
     selectedBlob = await canvasToBlob(canvas, 'image/jpeg', JPEG_QUALITY);
-    showPreview(selectedBlob);
+    showPreview(collectionBlob);
     stopCamera();
-    classificationSucceeded = await requestClassification(selectedBlob);
+    classificationSucceeded = await requestClassification(selectedBlob, collectionBlob);
   } catch (error) {
     console.error(error);
     showToast(error.message || 'Không thể chụp hoặc phân tích ảnh.');
@@ -582,7 +634,7 @@ function renderLearningMemory(result) {
   }
   const similarity = Math.round(Number(info.best_similarity || 0) * 100);
   const matched = Number(info.matched_examples || 0);
-  learningMemoryBadge.textContent = `🧠 Đã tham khảo ${matched} mẫu bạn từng xác nhận · tương đồng cao nhất ${similarity}%`;
+  learningMemoryBadge.textContent = `🧠 Đã tham khảo ${matched} mẫu đã xác nhận trong bộ nhớ dùng chung · tương đồng cao nhất ${similarity}%`;
   learningMemoryBadge.hidden = false;
 }
 
@@ -595,7 +647,7 @@ async function refreshLearningStats() {
     if (!response.ok) return;
     const total = Number(payload.learnable_examples || 0);
     const corrected = Number(payload.corrected || 0);
-    learningExampleCount.textContent = `Bộ nhớ học: ${total} mẫu · ${corrected} lần bạn đã sửa AI`;
+    learningExampleCount.textContent = `Bộ nhớ học dùng chung: ${total} mẫu · ${corrected} phản hồi đã sửa AI`;
   } catch (error) {
     console.warn('Không thể tải thống kê học:', error);
   }
@@ -776,8 +828,12 @@ async function processSelectedFile(file) {
   try {
     stopCamera();
     showPreview(file);
-    selectedBlob = await optimizeUploadedImage(file);
-    classificationSucceeded = await requestClassification(selectedBlob);
+    const [inferenceBlob, collectionBlob] = await Promise.all([
+      optimizeUploadedImage(file),
+      prepareCollectionImage(file)
+    ]);
+    selectedBlob = inferenceBlob;
+    classificationSucceeded = await requestClassification(inferenceBlob, collectionBlob);
   } catch (error) {
     console.error(error);
     showToast(error.message || 'Không thể đọc hoặc phân tích ảnh.');
@@ -1067,10 +1123,10 @@ async function saveHistoryEdit() {
 }
 
 function requestHistoryDeletePassword() {
-  const password = window.prompt('Nhập mật khẩu xóa lịch sử (HISTORY_DELETE_PASSWORD trong file .env):');
+  const password = window.prompt('Nhập mật khẩu xóa lịch sử:');
   if (password === null) return null;
   if (!password.trim()) {
-    showToast('Bạn phải nhập mật khẩu để xóa lịch sử.');
+    showToast('Không đúng mật khẩu.');
     return null;
   }
   return password;
@@ -1095,7 +1151,10 @@ async function deleteHistoryItem(item) {
     });
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
-    if (!response.ok) throw new Error(payload.detail || 'Không thể xóa lần quét này.');
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 503) throw new Error('Không đúng mật khẩu.');
+      throw new Error(payload.detail || 'Không thể xóa lần quét này.');
+    }
 
     releaseHistoryThumbnailUrl(item.id);
     if (historyEditItem?.id === item.id) {
@@ -1408,7 +1467,7 @@ document.querySelectorAll('[data-close-drawer]').forEach(element => element.addE
 clearHistoryButton.addEventListener('click', async () => {
   if (isBusy || isHistoryBusy || feedbackSubmitting) return;
   const confirmed = window.confirm(
-    'Xóa toàn bộ lịch sử dùng chung? Thao tác này xóa tất cả thumbnail và bộ nhớ học. ID đã dùng sẽ không được tái sử dụng để tránh ghép nhầm dữ liệu. Không thể hoàn tác.'
+    'Xóa toàn bộ lịch sử dùng chung? Thao tác này xóa thumbnail, bộ nhớ học và các ảnh dataset đã thu thập từ những lần quét này. ID đã dùng sẽ không được tái sử dụng để tránh ghép nhầm dữ liệu. Không thể hoàn tác.'
   );
   if (!confirmed) return;
   const deletePassword = requestHistoryDeletePassword();
@@ -1421,7 +1480,10 @@ clearHistoryButton.addEventListener('click', async () => {
     });
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
-    if (!response.ok) throw new Error(payload.detail || 'Không thể xóa lịch sử.');
+    if (!response.ok) {
+      if (response.status === 401 || response.status === 503) throw new Error('Không đúng mật khẩu.');
+      throw new Error(payload.detail || 'Không thể xóa lịch sử.');
+    }
     releaseHistoryThumbnailUrls();
     closeHistoryEditor();
     // The visible result may refer to a scan that was just deleted. Keep the
