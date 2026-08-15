@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -26,7 +26,6 @@ load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from .classifier import ModelUnavailableError, WasteClassifier
 from .database import (
-    DB_PATH,
     add_scan_if_history_generation,
     clear_scans,
     delete_scan,
@@ -613,14 +612,24 @@ async def classify_image(
         UploadFile | None,
         File(description="Ảnh chất lượng cao tùy chọn để lưu sau khi người dùng xác nhận nhãn"),
     ] = None,
+    persist: Annotated[bool, Form(description="Có lưu lịch sử/feedback cho lần quét này hay không")] = True,
+    source: Annotated[str, Form(description="Nguồn ảnh: user hoặc demo")] = "user",
     client_id: Annotated[str | None, Header(alias="X-Client-ID", max_length=128)] = None,
 ) -> dict[str, Any]:
     history_scope = _normalize_client_id(client_id)
-    # Register this request before reading/decoding the image. Once registered, a
-    # later full-history clear invalidates this request's persistence even if the
-    # clear happens before model inference actually begins.
-    async with history_mutation_gate:
-        history_generation = await run_in_threadpool(get_history_generation)
+    request_source = source.strip().lower()[:32] or "user"
+    is_demo = request_source == "demo"
+    persistence_enabled = bool(persist) and not is_demo
+
+    # Only persistent user scans participate in history/feedback memory. Demo
+    # requests are intentionally side-effect free and cannot contaminate training
+    # data or shared k-NN memory.
+    history_generation: int | None = None
+    if persistence_enabled:
+        # Register this request before reading/decoding the image. Once registered,
+        # a later full-history clear invalidates persistence for this request.
+        async with history_mutation_gate:
+            history_generation = await run_in_threadpool(get_history_generation)
 
     content = await image.read(MAX_IMAGE_BYTES + 1)
     if not content:
@@ -639,7 +648,7 @@ async def classify_image(
     # block classification; fall back to the validated inference upload.
     collection_source_image = primary_full_image
     collection_source = "inference_upload"
-    if collection_image is not None and DATASET_COLLECTION_ENABLED:
+    if persistence_enabled and collection_image is not None and DATASET_COLLECTION_ENABLED:
         try:
             collection_content = await collection_image.read(MAX_COLLECTION_IMAGE_BYTES + 1)
             if len(collection_content) > MAX_COLLECTION_IMAGE_BYTES:
@@ -665,11 +674,14 @@ async def classify_image(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     result = base_result
-    generation_still_current = (
-        await run_in_threadpool(get_history_generation) == history_generation
-    )
+    generation_still_current = False
+    if persistence_enabled and history_generation is not None:
+        generation_still_current = (
+            await run_in_threadpool(get_history_generation) == history_generation
+        )
     if (
-        generation_still_current
+        persistence_enabled
+        and generation_still_current
         and LEARNING_ENABLED
         and result.embedding
         and result.embedding_kind
@@ -699,53 +711,54 @@ async def classify_image(
     collection_pending_stored = False
     history_saved = False
     scan_id: int | None = None
-    async with history_mutation_gate:
-        scan_id = await run_in_threadpool(
-            add_scan_if_history_generation,
-            rule.key,
-            rule.display_name,
-            stored_category,
-            base_result.confidence,
-            result.uncertain,
-            base_result.key,
-            base_result.confidence,
-            base_result.uncertain,
-            result.confidence,
-            memory_applied,
-            history_scope,
-            history_generation,
-        )
-        if scan_id is not None:
-            history_saved = True
-            thumbnail_stored = await run_in_threadpool(
-                _save_scan_thumbnail,
-                scan_id,
+    if persistence_enabled and history_generation is not None:
+        async with history_mutation_gate:
+            scan_id = await run_in_threadpool(
+                add_scan_if_history_generation,
+                rule.key,
+                rule.display_name,
+                stored_category,
+                base_result.confidence,
+                result.uncertain,
+                base_result.key,
+                base_result.confidence,
+                base_result.uncertain,
+                result.confidence,
+                memory_applied,
                 history_scope,
-                pil_image,
+                history_generation,
             )
-            if DATASET_COLLECTION_ENABLED:
-                collection_pending_stored = await run_in_threadpool(
-                    _save_pending_collection_image,
+            if scan_id is not None:
+                history_saved = True
+                thumbnail_stored = await run_in_threadpool(
+                    _save_scan_thumbnail,
                     scan_id,
-                    collection_source_image,
+                    history_scope,
+                    pil_image,
                 )
-            if LEARNING_ENABLED and result.embedding and result.embedding_kind:
-                try:
-                    embedding_stored = await run_in_threadpool(
-                        store_scan_embedding,
+                if DATASET_COLLECTION_ENABLED:
+                    collection_pending_stored = await run_in_threadpool(
+                        _save_pending_collection_image,
                         scan_id,
-                        history_scope,
-                        result.embedding_kind,
-                        result.embedding,
+                        collection_source_image,
                     )
-                except sqlite3.Error:
-                    # The scan itself has already been committed. Embedding persistence is
-                    # optional metadata, so a transient DB failure must not make the client
-                    # believe that the whole classification failed and retry the scan.
-                    logger.exception("Could not store embedding for scan_id=%s", scan_id)
-                    embedding_stored = False
+                if LEARNING_ENABLED and result.embedding and result.embedding_kind:
+                    try:
+                        embedding_stored = await run_in_threadpool(
+                            store_scan_embedding,
+                            scan_id,
+                            history_scope,
+                            result.embedding_kind,
+                            result.embedding,
+                        )
+                    except sqlite3.Error:
+                        # The scan itself has already been committed. Embedding persistence is
+                        # optional metadata, so a transient DB failure must not make the client
+                        # believe that the whole classification failed and retry the scan.
+                        logger.exception("Could not store embedding for scan_id=%s", scan_id)
+                        embedding_stored = False
 
-    if not history_saved:
+    if persistence_enabled and not history_saved:
         # A clear occurred after this request started. Do not let feedback memory
         # from the pre-clear generation influence the visible post-clear result.
         result = base_result
@@ -770,7 +783,17 @@ async def classify_image(
         matched = int(memory_info.get("matched_examples", 0))
         notice += f" Kết quả này đã tham khảo {matched} mẫu đã xác nhận trong bộ nhớ dùng chung."
 
-    if not history_saved:
+    if is_demo:
+        notice += (
+            " Đây là ảnh minh họa dùng thử: kết quả không được lưu vào lịch sử, "
+            "không dùng bộ nhớ phản hồi và không được thêm vào dataset."
+        )
+    elif not persistence_enabled:
+        notice += (
+            " Kết quả này được yêu cầu không lưu, nên không tham gia lịch sử, "
+            "bộ nhớ phản hồi hoặc dataset."
+        )
+    elif not history_saved:
         notice += (
             " Lịch sử đã được xóa trong lúc AI xử lý ảnh nên kết quả này không được "
             "lưu và không thể phản hồi; hãy quét lại nếu bạn muốn lưu kết quả."
@@ -788,6 +811,8 @@ async def classify_image(
     return {
         "scan_id": scan_id,
         "history_saved": history_saved,
+        "source": request_source,
+        "persistence_enabled": persistence_enabled,
         **public_rule,
         # Keep the top-level prediction internally consistent: identity, score,
         # alternatives and uncertainty all describe the effective result after

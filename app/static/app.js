@@ -508,7 +508,7 @@ async function prepareCollectionImage(file) {
 }
 
 // --- Classification API Call ---
-async function requestClassification(blob, collectionBlob = null) {
+async function requestClassification(blob, collectionBlob = null, options = {}) {
   const requestId = ++requestSequence;
   activeRequestController?.abort();
   const controller = new AbortController();
@@ -516,6 +516,8 @@ async function requestClassification(blob, collectionBlob = null) {
 
   const formData = new FormData();
   formData.append('image', blob, 'waste-scan.jpg');
+  formData.append('persist', options.persist === false ? 'false' : 'true');
+  formData.append('source', options.source || 'user');
   if (collectionBlob && collectionBlob !== blob) {
     formData.append('collection_image', collectionBlob, 'waste-scan-hq.jpg');
   }
@@ -533,7 +535,7 @@ async function requestClassification(blob, collectionBlob = null) {
 
     if (requestId !== requestSequence) return false;
     renderResult(payload);
-    void loadHistory({ reset: true });
+    if (payload.history_saved) void loadHistory({ reset: true });
     void refreshHealth();
     return true;
   } catch (error) {
@@ -743,7 +745,9 @@ async function submitFeedback(correctKey) {
 function renderResult(result) {
   currentResult = result;
   if (feedbackStatus) {
-    if (result.history_saved === false || !result.scan_id) {
+    if (result.source === 'demo') {
+      feedbackStatus.textContent = 'Ảnh minh họa chỉ dùng thử; không lưu lịch sử, không học feedback và không thêm vào dataset.';
+    } else if (result.history_saved === false || !result.scan_id) {
       feedbackStatus.textContent = 'Kết quả này không được lưu vì lịch sử đã bị xóa trong lúc AI xử lý. Hãy quét lại để lưu và phản hồi.';
     } else if (result.learning?.enabled === false) {
       feedbackStatus.textContent = 'Bạn có thể xác nhận hoặc sửa kết quả; chức năng học từ phản hồi hiện đang tắt.';
@@ -820,7 +824,7 @@ dropZone.addEventListener('drop', async e => {
   processSelectedFile(file);
 });
 
-async function processSelectedFile(file) {
+async function processSelectedFile(file, options = {}) {
   if (isBusy || isHistoryBusy || feedbackSubmitting) return;
   clearResult();
   setBusy(true);
@@ -828,12 +832,13 @@ async function processSelectedFile(file) {
   try {
     stopCamera();
     showPreview(file);
+    const shouldPersist = options.persist !== false;
     const [inferenceBlob, collectionBlob] = await Promise.all([
       optimizeUploadedImage(file),
-      prepareCollectionImage(file)
+      shouldPersist ? prepareCollectionImage(file) : Promise.resolve(null)
     ]);
     selectedBlob = inferenceBlob;
-    classificationSucceeded = await requestClassification(inferenceBlob, collectionBlob);
+    classificationSucceeded = await requestClassification(inferenceBlob, collectionBlob, options);
   } catch (error) {
     console.error(error);
     showToast(error.message || 'Không thể đọc hoặc phân tích ảnh.');
@@ -861,7 +866,7 @@ document.querySelectorAll('.chip-btn').forEach(btn => {
       const response = await fetch(sampleUrl, { cache: 'force-cache' });
       if (!response.ok) throw new Error('Không thể tải ảnh minh họa mẫu.');
       const blob = await response.blob();
-      await processSelectedFile(blob);
+      await processSelectedFile(blob, { source: 'demo', persist: false });
     } catch (error) {
       console.error(error);
       showToast(error.message || 'Không thể mở ảnh minh họa mẫu.');

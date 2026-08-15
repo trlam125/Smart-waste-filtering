@@ -138,11 +138,16 @@ def ood_reference_path(*, colab: bool | None = None) -> Path:
     return resolve_project_path(candidate)
 
 
-def training_output_dir(architecture: str, *, colab: bool | None = None) -> Path:
-    detected = is_google_colab() if colab is None else bool(colab)
-    if detected:
-        return (runtime_root(colab=True) / "training" / architecture).resolve()
-    return (PROJECT_ROOT / "runs" / architecture).resolve()
+def training_output_dir(
+    architecture: str,
+    *,
+    colab: bool | None = None,
+) -> Path:
+    return (
+        PROJECT_ROOT
+        / "runs"
+        / architecture
+    ).resolve()
 
 
 def collection_pending_dir(collected_data_dir: Path, *, colab: bool | None = None) -> Path:

@@ -63,6 +63,9 @@ LEARNING_CERTAINTY_MIN_AGREEMENT = _float_env(
 LEARNING_CERTAINTY_MIN_SIMILARITY = _float_env(
     "LEARNING_CERTAINTY_MIN_SIMILARITY", 0.92, 0.0, 0.9999
 )
+LEARNING_DUPLICATE_SIMILARITY = _float_env(
+    "LEARNING_DUPLICATE_SIMILARITY", 0.995, 0.0, 1.0
+)
 
 
 def _cosine(left: Iterable[float], right: Iterable[float]) -> float:
@@ -78,6 +81,49 @@ def _cosine(left: Iterable[float], right: Iterable[float]) -> float:
     if left_norm <= 0.0 or right_norm <= 0.0:
         return 0.0
     return total / math.sqrt(left_norm * right_norm)
+
+
+def _deduplicate_neighbors(
+    neighbors: list[tuple[float, dict[str, Any]]],
+    *,
+    limit: int,
+) -> tuple[list[tuple[float, dict[str, Any]]], int]:
+    """Keep only independently distinct feedback embeddings.
+
+    ``neighbors`` must already be ordered by similarity to the current query. The
+    closest representative wins, so repeated scans of the same physical object do
+    not gain extra voting weight or satisfy certainty requirements by repetition.
+    """
+    independent: list[tuple[float, dict[str, Any]]] = []
+    duplicate_count = 0
+
+    for similarity, example in neighbors:
+        vector = example.get("embedding")
+        if not vector:
+            continue
+
+        is_duplicate = False
+        for _kept_similarity, kept_example in independent:
+            kept_vector = kept_example.get("embedding")
+            if not kept_vector or len(kept_vector) != len(vector):
+                continue
+            pair_similarity = _cosine(vector, kept_vector)
+            if (
+                math.isfinite(pair_similarity)
+                and pair_similarity >= LEARNING_DUPLICATE_SIMILARITY
+            ):
+                is_duplicate = True
+                duplicate_count += 1
+                break
+
+        if is_duplicate:
+            continue
+
+        independent.append((similarity, example))
+        if len(independent) >= limit:
+            break
+
+    return independent, duplicate_count
 
 
 def _normalize_scores(scores: dict[str, float]) -> dict[str, float]:
@@ -136,7 +182,11 @@ def apply_feedback_memory(
             neighbors.append((similarity, example))
 
     neighbors.sort(key=lambda item: item[0], reverse=True)
-    neighbors = neighbors[:LEARNING_TOP_K]
+    raw_matched_examples = len(neighbors)
+    neighbors, duplicate_examples_ignored = _deduplicate_neighbors(
+        neighbors,
+        limit=LEARNING_TOP_K,
+    )
     if not neighbors:
         analysis = dict(result.analysis)
         analysis["learning_memory"] = {
@@ -264,6 +314,9 @@ def apply_feedback_memory(
         "applied": True,
         "embedding_kind": embedding_kind,
         "matched_examples": len(neighbors),
+        "raw_matched_examples": raw_matched_examples,
+        "duplicate_examples_ignored": duplicate_examples_ignored,
+        "duplicate_similarity_threshold": LEARNING_DUPLICATE_SIMILARITY,
         "best_similarity": round(best_similarity, 4),
         "weight": round(memory_weight, 4),
         "suggested_key": memory_key,

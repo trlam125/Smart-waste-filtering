@@ -130,7 +130,7 @@ You can copy `.env.example` to `.env`. The main variables are:
 ```env
 WASTE_MODEL_CHECKPOINT=models/best_model.pt
 WASTE_DEVICE=auto
-UNKNOWN_THRESHOLD=0.45
+UNKNOWN_THRESHOLD=0.60
 UNCERTAINTY_MARGIN=0.10
 DATABASE_PATH=data/waste_scanner.db
 ```
@@ -378,363 +378,173 @@ Or run in 1 cell:
 ```
 import os
 import sys
-import time
-import signal
-import socket
 import subprocess
 from pathlib import Path
 
-PROJECT_DIR = Path("/content/drive/MyDrive/Colab Notebooks/Smart waste scanner")
+PROJECT_DIR = Path(
+    "/content/drive/MyDrive/Colab Notebooks/Smart waste scanner"
+)
 
 PORT = 8000
 USE_NGROK = True
-RELOAD = False
 STARTUP_TIMEOUT = 600
-
-LAUNCHER_BUILD = "2026-08-15-status-v3-port-fix"
 
 print("=" * 72)
 print("SMART WASTE SCANNER - COLAB")
-print(f"PROJECT: {PROJECT_DIR}")
+print(f"Project : {PROJECT_DIR}")
 print("=" * 72)
-print(f"Launcher build: {LAUNCHER_BUILD}")
 
-if not Path("/content/drive/MyDrive").exists():
-    from google.colab import drive
-    drive.mount("/content/drive")
+from google.colab import drive
+
+MY_DRIVE = Path("/content/drive/MyDrive")
+
+
+def drive_ready():
+    try:
+        if not MY_DRIVE.is_dir():
+            return False
+
+        next(MY_DRIVE.iterdir(), None)
+        return True
+
+    except Exception:
+        return False
+
+
+if not drive_ready():
+    print("Mount Google Drive...")
+
+    try:
+        drive.flush_and_unmount()
+    except Exception:
+        pass
+
+    drive.mount(
+        "/content/drive",
+        force_remount=True,
+        timeout_ms=180000,
+    )
+
+    print("Google Drive mount thanh cong.")
 else:
-    print("Google Drive da duoc mount.")
+    print("Google Drive da san sang.")
 
 if not PROJECT_DIR.exists():
-    raise FileNotFoundError(f"Khong tim thay project:\n{PROJECT_DIR}")
+    raise FileNotFoundError(
+        f"Khong tim thay project:\n{PROJECT_DIR}"
+    )
 
 os.chdir(PROJECT_DIR)
 
 print(f"Working directory: {os.getcwd()}")
 
-def port_is_busy(port: int) -> bool:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
+LAUNCHER = PROJECT_DIR / "launcher.py"
 
-    try:
-        result = sock.connect_ex(("127.0.0.1", port))
-        return result == 0
-    finally:
-        sock.close()
-
-def get_port_pids(port: int):
-    pids = set()
-
-    try:
-        result = subprocess.run(
-            ["bash", "-lc", f"lsof -ti:{port} 2>/dev/null || true"],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-    except Exception:
-        pass
-
-    if not pids:
-        try:
-            result = subprocess.run(
-                ["bash", "-lc", f"fuser {port}/tcp 2>/dev/null || true"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            for token in result.stdout.replace(":", " ").split():
-                token = token.strip()
-                if token.isdigit():
-                    pids.add(int(token))
-        except Exception:
-            pass
-
-    return sorted(pids)
-
-def get_process_info(pid: int):
-    try:
-        result = subprocess.run(
-            ["ps", "-p", str(pid), "-o", "pid=,ppid=,cmd="],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
-def wait_port_free(port: int, timeout: float = 10):
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        if not port_is_busy(port):
-            return True
-        time.sleep(0.25)
-
-    return not port_is_busy(port)
-
-def kill_port_processes(port: int):
-    if not port_is_busy(port):
-        print(f"Port {port} dang trong.")
-        return True
-
-    print("=" * 72)
-    print(f"PORT {port} DANG BI CHIEM")
-    print("=" * 72)
-
-    pids = get_port_pids(port)
-
-    if not pids:
-        subprocess.run(
-            ["bash", "-lc", f"fuser -k {port}/tcp 2>/dev/null || true"],
-            capture_output=True,
-            text=True
-        )
-
-        time.sleep(2)
-        return not port_is_busy(port)
-
-    print(f"Tim thay PID: {pids}")
-
-    for pid in pids:
-        info = get_process_info(pid)
-        if info:
-            print(info)
-
-    for pid in pids:
-        if pid == os.getpid():
-            continue
-
-        try:
-            os.kill(pid, signal.SIGTERM)
-            print(f"SIGTERM PID {pid}")
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            pass
-
-    if wait_port_free(port, timeout=5):
-        print(f"Port {port} da duoc giai phong.")
-        return True
-
-    remaining = get_port_pids(port)
-
-    for pid in remaining:
-        if pid == os.getpid():
-            continue
-
-        try:
-            os.kill(pid, signal.SIGKILL)
-            print(f"SIGKILL PID {pid}")
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            pass
-
-    return wait_port_free(port, timeout=5)
-
-print()
-print("=" * 72)
-print("CHECK PORT")
-print("=" * 72)
-
-if not kill_port_processes(PORT):
-    subprocess.run(
-        ["bash", "-lc", f"lsof -i:{PORT} || true"]
+if not LAUNCHER.exists():
+    raise FileNotFoundError(
+        f"Khong tim thay launcher.py:\n{LAUNCHER}"
     )
-    raise RuntimeError(f"Port {PORT} van dang bi chiem.")
-
-print()
-print("=" * 72)
-print("CHECK OLD NGROK")
-print("=" * 72)
 
 try:
-    result = subprocess.run(
-        ["pgrep", "-f", "ngrok"],
-        capture_output=True,
-        text=True
-    )
+    import torch
 
-    ngrok_pids = []
+    print()
+    print("=" * 72)
+    print("DEVICE")
+    print("=" * 72)
 
-    for line in result.stdout.splitlines():
-        line = line.strip()
+    print("PyTorch :", torch.__version__)
+    print("CUDA    :", torch.cuda.is_available())
 
-        if line.isdigit():
-            pid = int(line)
-            if pid != os.getpid():
-                ngrok_pids.append(pid)
-
-    if ngrok_pids:
-        for pid in ngrok_pids:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
-
-        time.sleep(1)
-        print("Da dung ngrok cu.")
+    if torch.cuda.is_available():
+        print("GPU     :", torch.cuda.get_device_name(0))
     else:
-        print("Khong co ngrok cu.")
+        print("GPU     : Khong co - app se fallback CPU.")
 
 except Exception as e:
-    print(f"Khong kiem tra duoc ngrok: {e}")
-
-possible_launchers = [
-    "launcher.py",
-    "run.py",
-    "app.py",
-    "main.py",
-]
-
-existing = [
-    f for f in possible_launchers
-    if (PROJECT_DIR / f).exists()
-]
-
-print()
-print("=" * 72)
-print("CHECK PATHS")
-print("=" * 72)
-
-if existing:
-    print("Python entry files:", ", ".join(existing))
-
-LAUNCHER_FILE = PROJECT_DIR / "launcher.py"
-
-if not LAUNCHER_FILE.exists():
-    fallback_candidates = [
-        PROJECT_DIR / "run.py",
-        PROJECT_DIR / "app.py",
-        PROJECT_DIR / "main.py",
-    ]
-
-    LAUNCHER_FILE = next(
-        (p for p in fallback_candidates if p.exists()),
-        None
-    )
-
-if LAUNCHER_FILE is None:
-    raise FileNotFoundError(
-        "Khong tim thay launcher.py, run.py, app.py hoac main.py."
-    )
-
-print(f"Launcher file: {LAUNCHER_FILE}")
+    print(f"Khong kiem tra duoc PyTorch: {e}")
 
 cmd = [
     sys.executable,
     "-u",
-    str(LAUNCHER_FILE),
+    str(LAUNCHER),
+
+    "--port",
+    str(PORT),
+
+    "--replace-port",
+
+    "--startup-timeout",
+    str(STARTUP_TIMEOUT),
 ]
 
-try:
-    help_result = subprocess.run(
-        [
-            sys.executable,
-            str(LAUNCHER_FILE),
-            "--help"
-        ],
-        capture_output=True,
-        text=True,
-        timeout=20
-    )
-
-    help_text = help_result.stdout + "\n" + help_result.stderr
-except Exception:
-    help_text = ""
-
-if "--port" in help_text:
-    cmd += ["--port", str(PORT)]
-
-if USE_NGROK and "--ngrok" in help_text:
-    cmd += ["--ngrok"]
-
-if RELOAD and "--reload" in help_text:
-    cmd += ["--reload"]
-
-if "--timeout" in help_text:
-    cmd += ["--timeout", str(STARTUP_TIMEOUT)]
+if USE_NGROK:
+    cmd.append("--ngrok")
 
 print()
 print("=" * 72)
 print("START SMART WASTE SCANNER")
 print("=" * 72)
-print(f"WASTE SCANNER LAUNCHER | build={LAUNCHER_BUILD}")
-print(f"Python     : {sys.executable}")
-print(f"Project    : {PROJECT_DIR}")
-print("Colab      : True")
-print(f"Port       : {PORT}")
-print(f"Ngrok      : {USE_NGROK}")
-print(f"Reload     : {RELOAD}")
-print("=" * 72)
+
+print(f"Python  : {sys.executable}")
+print(f"Project : {PROJECT_DIR}")
+print(f"Port    : {PORT}")
+print(f"Ngrok   : {USE_NGROK}")
+print(f"Timeout : {STARTUP_TIMEOUT}s")
+
 print()
 print("Command:")
 print(" ".join(map(str, cmd)))
+
+print("=" * 72)
 print()
+
 
 process = subprocess.Popen(
     cmd,
     cwd=str(PROJECT_DIR),
+
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
+
     text=True,
     bufsize=1,
-    universal_newlines=True,
+
     env={
         **os.environ,
         "PYTHONUNBUFFERED": "1",
-    }
+    },
 )
 
 try:
-    for line in iter(process.stdout.readline, ""):
-        if not line and process.poll() is not None:
-            break
-
-        if line:
-            print(line, end="", flush=True)
+    for line in process.stdout:
+        print(
+            line,
+            end="",
+            flush=True,
+        )
 
 except KeyboardInterrupt:
-    try:
-        process.terminate()
-        process.wait(timeout=5)
-    except Exception:
-        try:
-            process.kill()
-        except Exception:
-            pass
 
-    raise
+    print("\nStopping Smart Waste Scanner...")
+
+    process.terminate()
+
+    try:
+        process.wait(timeout=5)
+
+    except subprocess.TimeoutExpired:
+        process.kill()
 
 finally:
     if process.stdout:
         process.stdout.close()
 
-return_code = process.poll()
+code = process.wait()
 
-print()
-print("=" * 72)
-
-if return_code == 0:
-    print("Smart Waste Scanner launcher da ket thuc binh thuong.")
-elif return_code is None:
-    print("Smart Waste Scanner dang chay.")
-else:
-    print(f"Launcher ket thuc voi code {return_code}")
-
-print("=" * 72)
-
-if return_code not in (0, None):
+if code != 0:
     raise RuntimeError(
-        f"Launcher ket thuc voi code {return_code}"
+        f"Launcher ket thuc voi code {code}"
     )
 ```
 
