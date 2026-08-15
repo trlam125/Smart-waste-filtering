@@ -12,6 +12,11 @@ services:
       DATABASE_PATH: /app/data/waste_scanner.db
       WASTE_MODEL_CHECKPOINT: /app/models/best_model.pt
       WASTE_DEVICE: ${WASTE_DEVICE:-cpu}
+      OOD_DETECTION_ENABLED: ${OOD_DETECTION_ENABLED:-true}
+      # Docker runtime is intentionally read-only for model assets. Build the OOD bank offline.
+      OOD_AUTO_BUILD: "false"
+      OOD_REFERENCE_PATH: /app/models/ood_reference.npz
+      OOD_MIN_SIMILARITY: ${OOD_MIN_SIMILARITY:-}
       UNKNOWN_THRESHOLD: ${UNKNOWN_THRESHOLD:-0.60}
       UNCERTAINTY_MARGIN: ${UNCERTAINTY_MARGIN:-0.10}
       MODEL_RETRY_SECONDS: ${MODEL_RETRY_SECONDS:-10}

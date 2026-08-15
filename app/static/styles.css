@@ -1644,3 +1644,121 @@ body {
   }
   .result-icon-glow { font-size: 44px; }
 }
+
+
+/* Mobile viewport overflow hardening - v1.10.8 */
+html,
+body {
+  max-width: 100%;
+  overflow-x: clip;
+}
+
+.drawer {
+  width: 100%;
+  max-width: 100vw;
+  overflow: hidden;
+}
+
+.drawer-panel,
+.history-list,
+.history-controls,
+.history-stats,
+.drawer-footer,
+.history-item,
+.history-item-info,
+.history-item-actions {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.history-item {
+  width: 100%;
+}
+
+.history-item-info strong,
+.history-item-info small {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.history-edit-modal,
+.history-edit-card,
+.history-edit-body,
+.history-edit-details {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.history-edit-card {
+  overflow-x: hidden;
+}
+
+@media (max-width: 720px) {
+  .drawer-panel {
+    right: 0;
+    left: 0;
+    width: 100vw;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+
+  .history-list {
+    width: 100%;
+    overflow-x: hidden;
+  }
+
+  .history-item {
+    grid-template-columns: 64px minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  .history-thumb-button {
+    min-width: 0;
+    max-width: 64px;
+  }
+
+  .history-item-actions {
+    width: 100%;
+  }
+
+  .history-edit-modal {
+    width: 100vw;
+    max-width: 100vw;
+    overflow-x: hidden;
+  }
+
+  .history-edit-card {
+    width: 100%;
+    max-width: 100%;
+  }
+}
+
+@media (max-width: 480px) {
+  .drawer-panel {
+    padding-right: max(14px, env(safe-area-inset-right));
+    padding-left: max(14px, env(safe-area-inset-left));
+  }
+
+  .history-item {
+    grid-template-columns: 56px minmax(0, 1fr);
+    gap: 10px;
+    padding: 10px;
+  }
+
+  .history-thumb-button {
+    width: 56px;
+    height: 56px;
+    max-width: 56px;
+  }
+
+  .history-score {
+    grid-column: 2;
+    max-width: 100%;
+  }
+
+  .history-edit-button,
+  .history-delete-button {
+    max-width: 100%;
+    white-space: normal;
+  }
+}

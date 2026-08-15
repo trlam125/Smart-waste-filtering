@@ -22,8 +22,8 @@ Smart waste scanner/
 On the first run, the code automatically extracts the dataset. The cache location depends on the environment:
 
 ```text
-Local : data/dataset/_extracted/
-Colab : /content/smart_waste_scanner_dataset/
+Local : data/.runtime/dataset_extracted/
+Colab : /content/smart_waste_scanner_runtime/dataset_extracted/
 ```
 
 On Colab, the extracted files stay on the runtime SSD, so Google Drive only needs to keep `dataset.zip`. The cache is reused within the same runtime. If the Colab runtime resets, `/content` is cleared and the archive is extracted again. Replacing `dataset.zip` also causes the cache to be rebuilt automatically.
@@ -212,7 +212,7 @@ My Drive/
 There is no need to store the extracted dataset image directory on Google Drive. When running in Colab, `training/dataset_utils.py` automatically uses:
 
 ```text
-/content/smart_waste_scanner_dataset
+/content/smart_waste_scanner_runtime/dataset_extracted
 ```
 
 as the extraction cache. Because `/content` is temporary storage for the Colab runtime, this cache is lost when the runtime resets and is automatically recreated from `data/dataset/dataset.zip` on the next run.
@@ -272,7 +272,7 @@ Then run:
 In Colab, on the first run the project will extract the ZIP into:
 
 ```text
-/content/smart_waste_scanner_dataset
+/content/smart_waste_scanner_runtime/dataset_extracted
 ```
 
 You can check the paths the code is using with:
@@ -288,7 +288,7 @@ Expected Colab output:
 
 ```text
 Dataset ZIP: .../Smart waste scanner/data/dataset/dataset.zip
-Extract to : /content/smart_waste_scanner_dataset
+Extract to : /content/smart_waste_scanner_runtime/dataset_extracted
 ```
 
 Train
@@ -391,7 +391,7 @@ STARTUP_TIMEOUT = 600
 
 print("=" * 72)
 print("SMART WASTE SCANNER - COLAB")
-print(f"Project : {PROJECT_DIR}")
+print(f"Dự án  : {PROJECT_DIR}")
 print("=" * 72)
 
 from google.colab import drive
@@ -403,16 +403,14 @@ def drive_ready():
     try:
         if not MY_DRIVE.is_dir():
             return False
-
         next(MY_DRIVE.iterdir(), None)
         return True
-
     except Exception:
         return False
 
 
 if not drive_ready():
-    print("Mount Google Drive...")
+    print("Đang kết nối Google Drive...")
 
     try:
         drive.flush_and_unmount()
@@ -425,55 +423,84 @@ if not drive_ready():
         timeout_ms=180000,
     )
 
-    print("Google Drive mount thanh cong.")
+    if not drive_ready():
+        raise RuntimeError(
+            "Google Drive đã kết nối nhưng không truy cập được MyDrive."
+        )
+
+    print("Google Drive đã kết nối.")
 else:
-    print("Google Drive da san sang.")
+    print("Google Drive đã sẵn sàng.")
+
 
 if not PROJECT_DIR.exists():
     raise FileNotFoundError(
-        f"Khong tim thay project:\n{PROJECT_DIR}"
+        f"Không tìm thấy dự án:\n{PROJECT_DIR}"
     )
 
 os.chdir(PROJECT_DIR)
-
-print(f"Working directory: {os.getcwd()}")
 
 LAUNCHER = PROJECT_DIR / "launcher.py"
 
 if not LAUNCHER.exists():
     raise FileNotFoundError(
-        f"Khong tim thay launcher.py:\n{LAUNCHER}"
+        f"Không tìm thấy launcher.py:\n{LAUNCHER}"
     )
+
+
+try:
+    import pyngrok
+except ImportError:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-q",
+            "--disable-pip-version-check",
+            "pyngrok>=8.1,<9.0",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Không cài được pyngrok:\n"
+            + result.stderr.strip()
+        )
+
+
+print()
+print("=" * 72)
+print("THIẾT BỊ")
+print("=" * 72)
 
 try:
     import torch
 
-    print()
-    print("=" * 72)
-    print("DEVICE")
-    print("=" * 72)
-
-    print("PyTorch :", torch.__version__)
-    print("CUDA    :", torch.cuda.is_available())
+    print(f"PyTorch : {torch.__version__}")
 
     if torch.cuda.is_available():
-        print("GPU     :", torch.cuda.get_device_name(0))
+        print("CUDA    : Có")
+        print(f"GPU     : {torch.cuda.get_device_name(0)}")
     else:
-        print("GPU     : Khong co - app se fallback CPU.")
+        print("CUDA    : Không")
+        print("Thiết bị: CPU")
 
 except Exception as e:
-    print(f"Khong kiem tra duoc PyTorch: {e}")
+    print(f"Không kiểm tra được PyTorch: {e}")
+
 
 cmd = [
     sys.executable,
     "-u",
     str(LAUNCHER),
-
     "--port",
     str(PORT),
-
     "--replace-port",
-
     "--startup-timeout",
     str(STARTUP_TIMEOUT),
 ]
@@ -481,21 +508,13 @@ cmd = [
 if USE_NGROK:
     cmd.append("--ngrok")
 
-print()
-print("=" * 72)
-print("START SMART WASTE SCANNER")
-print("=" * 72)
-
-print(f"Python  : {sys.executable}")
-print(f"Project : {PROJECT_DIR}")
-print(f"Port    : {PORT}")
-print(f"Ngrok   : {USE_NGROK}")
-print(f"Timeout : {STARTUP_TIMEOUT}s")
 
 print()
-print("Command:")
-print(" ".join(map(str, cmd)))
-
+print("=" * 72)
+print("KHỞI ĐỘNG SMART WASTE SCANNER")
+print("=" * 72)
+print(f"Cổng    : {PORT}")
+print(f"Ngrok   : {'Có' if USE_NGROK else 'Không'}")
 print("=" * 72)
 print()
 
@@ -503,48 +522,43 @@ print()
 process = subprocess.Popen(
     cmd,
     cwd=str(PROJECT_DIR),
-
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
-
     text=True,
     bufsize=1,
-
     env={
         **os.environ,
         "PYTHONUNBUFFERED": "1",
     },
 )
 
+
 try:
     for line in process.stdout:
-        print(
-            line,
-            end="",
-            flush=True,
-        )
+        print(line, end="", flush=True)
 
 except KeyboardInterrupt:
-
-    print("\nStopping Smart Waste Scanner...")
+    print("\nĐang dừng Smart Waste Scanner...")
 
     process.terminate()
 
     try:
         process.wait(timeout=5)
-
     except subprocess.TimeoutExpired:
         process.kill()
+
+    raise
 
 finally:
     if process.stdout:
         process.stdout.close()
 
+
 code = process.wait()
 
 if code != 0:
     raise RuntimeError(
-        f"Launcher ket thuc voi code {code}"
+        f"Launcher kết thúc với mã lỗi {code}"
     )
 ```
 
@@ -555,14 +569,14 @@ The local project and the project on Drive use the same source code. Environment
 ```text
 Local
 - dataset.zip: data/dataset/dataset.zip
-- extract:     data/dataset/_extracted
+- extract:     data/.runtime/dataset_extracted
 - model:       models/best_model.pt
 - database:    data/waste_scanner.db
 - collected:   data/collected
 
 Google Colab
 - dataset.zip: .../Drive/.../data/dataset/dataset.zip
-- extract:     /content/smart_waste_scanner_dataset
+- extract:     /content/smart_waste_scanner_runtime/dataset_extracted
 - model:       models/best_model.pt on Drive
 - database:    data/waste_scanner.db on Drive
 - collected:   data/collected on Drive
