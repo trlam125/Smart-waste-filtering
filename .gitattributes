@@ -13,3 +13,5 @@
 *.webp binary
 *.ico binary
 *.db binary
+*.pt binary
+*.zip binary

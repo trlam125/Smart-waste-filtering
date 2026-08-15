@@ -245,8 +245,11 @@ def wait_for_server(
     expected_token: str | None,
     timeout_seconds: int = 90,
     process: subprocess.Popen[bytes] | None = None,
+    *,
+    require_ready: bool = False,
 ) -> dict[str, object]:
-    url = f"http://127.0.0.1:{port}/api/health"
+    endpoint = "/api/ready" if require_ready else "/api/health"
+    url = f"http://127.0.0.1:{port}{endpoint}"
     deadline = time.monotonic() + timeout_seconds
     last_error = ""
     while time.monotonic() < deadline:
@@ -263,9 +266,8 @@ def wait_for_server(
             with urllib.request.urlopen(url, timeout=2) as response:
                 payload = _decode_health_response(response)
         except urllib.error.HTTPError as exc:
-            # /api/health intentionally returns 503 when the classifier is
-            # degraded. The HTTP server is still alive, so inspect its JSON
-            # body instead of treating every non-2xx response as offline.
+            # /api/ready intentionally returns 503 until the classifier is ready.
+            # The HTTP server may already be alive, so inspect its JSON body.
             try:
                 payload = _decode_health_response(exc)
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as decode_exc:
@@ -283,20 +285,34 @@ def wait_for_server(
         if payload is not None:
             if payload.get("app") != "waste-scanner-ai":
                 last_error = "Port dang tra ve mot server khac, khong phai Waste Scanner AI."
-            elif expected_token is None:
-                return payload
             else:
                 actual_token = str(payload.get("launch_token", ""))
-                if actual_token == expected_token:
-                    return payload
-                if actual_token:
-                    last_error = "Port dang tra ve mot instance Waste Scanner khac."
+                token_matches = expected_token is None or actual_token == expected_token
+                if not token_matches:
+                    if actual_token:
+                        last_error = "Port dang tra ve mot instance Waste Scanner khac."
+                    else:
+                        last_error = "Port dang tra ve mot server cu/khac khong co launch token."
+                elif require_ready and not bool(payload.get("ready")):
+                    classifier = payload.get("classifier")
+                    classifier_state = (
+                        str(classifier.get("state", "")) if isinstance(classifier, dict) else ""
+                    )
+                    classifier_error = (
+                        str(classifier.get("error", "")) if isinstance(classifier, dict) else ""
+                    )
+                    if classifier_state in {"error", "retry_available"}:
+                        detail = f": {classifier_error}" if classifier_error else ""
+                        raise RuntimeError(f"Model AI khong san sang{detail}")
+                    last_error = f"Model AI dang khoi dong (state={classifier_state or 'unknown'})."
                 else:
-                    last_error = "Port dang tra ve mot server cu/khac khong co launch token."
+                    return payload
 
         time.sleep(0.5)
 
     detail = f" ({last_error})" if last_error else ""
+    if require_ready:
+        raise RuntimeError(f"AI model khong san sang tai {url}{detail}.")
     if expected_token is None:
         raise RuntimeError(f"Khong tim thay Waste Scanner AI dang chay tai {url}{detail}.")
     raise RuntimeError(f"FastAPI moi khong san sang tai {url}{detail}.")
@@ -434,10 +450,10 @@ def run_ngrok(port: int, reload_enabled: bool, no_server: bool, open_browser: bo
             launch_token = uuid.uuid4().hex
             print(f"[Waste Scanner] Khoi dong FastAPI tai http://127.0.0.1:{port}")
             server = start_server(port, reload_enabled, launch_token)
-            wait_for_server(port, launch_token, process=server)
+            wait_for_server(port, launch_token, process=server, require_ready=True)
         else:
             print(f"[Waste Scanner] Kiem tra server co san tai http://127.0.0.1:{port}")
-            wait_for_server(port, expected_token=None, timeout_seconds=5)
+            wait_for_server(port, expected_token=None, timeout_seconds=90, require_ready=True)
 
         print("[ngrok] Dang tao HTTPS tunnel...")
         ngrok_client, tunnel = build_tunnel(port)

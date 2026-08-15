@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import csv
+import hmac
 import io
 import logging
 import os
@@ -17,6 +18,10 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageOps, UnidentifiedImageError
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from .classifier import ModelUnavailableError, WasteClassifier
 from .database import (
@@ -24,22 +29,13 @@ from .database import (
     add_scan_if_history_generation,
     clear_scans,
     delete_scan,
-    get_learning_examples,
-    get_learning_stats,
-    get_history_clear_timestamp,
     get_history_generation,
     get_history_page,
-    get_max_scan_id,
-    get_scan_thumbnail_name,
+    get_learning_examples,
+    get_learning_stats,
     get_scan_thumbnail_state,
     initialize_database,
-    list_all_scan_thumbnail_names,
-    list_scan_ids_without_thumbnail,
-    list_scan_recovery_tombstones,
-    migrate_legacy_embedding_kind,
     record_feedback,
-    recover_missing_scan_from_thumbnail,
-    recover_scan_thumbnail_name,
     set_scan_thumbnail_name,
     store_scan_embedding,
 )
@@ -55,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-RESERVED_CLIENT_IDS = {"anonymous", "legacy"}
+RESERVED_CLIENT_IDS = {"anonymous"}
 
 
 class FeedbackPayload(BaseModel):
@@ -98,18 +94,47 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
 
 MAX_IMAGE_PIXELS = _positive_int_env("MAX_IMAGE_PIXELS", 20_000_000)
 PRELOAD_MODEL = _bool_env("PRELOAD_MODEL", True)
-MIGRATE_LEGACY_THUMBNAILS = _bool_env("MIGRATE_LEGACY_THUMBNAILS", False)
 CLASSIFIER_IMAGE_MAX_DIMENSION = _positive_int_env("CLASSIFIER_IMAGE_MAX_DIMENSION", 1024)
 THUMBNAIL_MAX_DIMENSION = _positive_int_env("THUMBNAIL_MAX_DIMENSION", 480)
 THUMBNAIL_JPEG_QUALITY = _bounded_int_env("THUMBNAIL_JPEG_QUALITY", 80, 40, 95)
-LEGACY_SCAN_THUMBNAIL_DIR = DB_PATH.parent / "scans"
+HISTORY_DELETE_PASSWORD = os.getenv("HISTORY_DELETE_PASSWORD", "").strip()
 _SCAN_THUMBNAIL_DIR_ENV = os.getenv("SCAN_THUMBNAIL_DIR", "").strip()
-if _SCAN_THUMBNAIL_DIR_ENV:
-    SCAN_THUMBNAIL_DIR = Path(_SCAN_THUMBNAIL_DIR_ENV).expanduser()
-else:
-    db_namespace_hash = hashlib.sha256(DB_PATH.name.encode("utf-8")).hexdigest()[:8]
-    db_namespace = f"{DB_PATH.stem}-{db_namespace_hash}"
-    SCAN_THUMBNAIL_DIR = LEGACY_SCAN_THUMBNAIL_DIR / db_namespace
+SCAN_THUMBNAIL_DIR = (
+    Path(_SCAN_THUMBNAIL_DIR_ENV).expanduser()
+    if _SCAN_THUMBNAIL_DIR_ENV
+    else DB_PATH.parent / "scans"
+)
+
+# Real-world dataset collection. A high-quality, EXIF-corrected JPEG is staged
+# for each saved scan. It becomes a durable labeled training sample only after
+# the user confirms or corrects the label through /api/feedback.
+DATASET_COLLECTION_ENABLED = _bool_env("DATASET_COLLECTION_ENABLED", True)
+COLLECTED_IMAGE_MAX_DIMENSION = _positive_int_env("COLLECTED_IMAGE_MAX_DIMENSION", 1600)
+COLLECTED_JPEG_QUALITY = _bounded_int_env("COLLECTED_JPEG_QUALITY", 92, 70, 98)
+_COLLECTED_DATA_DIR_ENV = os.getenv("COLLECTED_DATA_DIR", "").strip()
+_default_collected_dir = DB_PATH.parent / "collected"
+if not _default_collected_dir.is_absolute():
+    _default_collected_dir = PROJECT_ROOT / _default_collected_dir
+COLLECTED_DATA_DIR = (
+    Path(_COLLECTED_DATA_DIR_ENV).expanduser()
+    if _COLLECTED_DATA_DIR_ENV
+    else _default_collected_dir
+)
+if not COLLECTED_DATA_DIR.is_absolute():
+    COLLECTED_DATA_DIR = PROJECT_ROOT / COLLECTED_DATA_DIR
+COLLECTED_PENDING_DIR = COLLECTED_DATA_DIR / "_pending"
+COLLECTED_METADATA_PATH = COLLECTED_DATA_DIR / "metadata.csv"
+
+
+def _require_history_delete_password(candidate: str | None) -> None:
+    if not HISTORY_DELETE_PASSWORD:
+        raise HTTPException(
+            status_code=503,
+            detail="Chức năng xóa đang bị khóa vì HISTORY_DELETE_PASSWORD chưa được cấu hình trong .env.",
+        )
+    supplied = (candidate or "").strip()
+    if not supplied or not hmac.compare_digest(supplied, HISTORY_DELETE_PASSWORD):
+        raise HTTPException(status_code=401, detail="Mật khẩu xóa không đúng.")
 classifier = WasteClassifier()
 # Gate requests before they enter Starlette's shared threadpool. The classifier
 # still keeps its internal threading lock as a second line of protection.
@@ -162,9 +187,163 @@ def _save_scan_thumbnail(scan_id: int, client_id: str, image: Image.Image) -> bo
         return False
 
 
-def _thumbnail_directories() -> tuple[Path, ...]:
-    """Runtime thumbnail access is isolated to this database namespace only."""
-    return (SCAN_THUMBNAIL_DIR,)
+def _save_pending_collection_image(scan_id: int, image: Image.Image) -> bool:
+    """Stage a training-quality image until its label is confirmed by feedback."""
+    if not DATASET_COLLECTION_ENABLED:
+        return False
+    target = COLLECTED_PENDING_DIR / f"scan_{scan_id}.jpg"
+    temporary = COLLECTED_PENDING_DIR / f".scan_{scan_id}_{os.getpid()}.tmp"
+    try:
+        COLLECTED_PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        sample = image.copy()
+        sample.thumbnail(
+            (COLLECTED_IMAGE_MAX_DIMENSION, COLLECTED_IMAGE_MAX_DIMENSION),
+            Image.Resampling.LANCZOS,
+        )
+        sample.save(
+            temporary,
+            format="JPEG",
+            quality=COLLECTED_JPEG_QUALITY,
+            optimize=True,
+        )
+        temporary.replace(target)
+        return True
+    except OSError:
+        logger.exception("Could not stage dataset image for scan_id=%s", scan_id)
+        temporary.unlink(missing_ok=True)
+        return False
+
+
+def _collection_sample_candidates(scan_id: int) -> list[Path]:
+    filename = f"scan_{scan_id}.jpg"
+    candidates: list[Path] = []
+    for key in RULE_BY_KEY:
+        path = COLLECTED_DATA_DIR / key / filename
+        try:
+            if path.is_file():
+                candidates.append(path)
+        except OSError:
+            continue
+    return candidates
+
+
+def _update_collection_metadata(
+    scan_id: int,
+    *,
+    label: str,
+    predicted_key: str,
+    is_correct: bool,
+    image_path: Path,
+) -> None:
+    """Upsert one row in metadata.csv using an atomic replace."""
+    fields = ("scan_id", "image_path", "label", "predicted_key", "is_correct", "updated_at")
+    rows: dict[int, dict[str, str]] = {}
+    if COLLECTED_METADATA_PATH.is_file():
+        try:
+            with COLLECTED_METADATA_PATH.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        row_id = int(row.get("scan_id", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    rows[row_id] = {field: str(row.get(field, "")) for field in fields}
+        except OSError:
+            logger.warning("Could not read collection metadata; rebuilding it", exc_info=True)
+
+    rows[scan_id] = {
+        "scan_id": str(scan_id),
+        "image_path": image_path.relative_to(COLLECTED_DATA_DIR).as_posix(),
+        "label": label,
+        "predicted_key": predicted_key,
+        "is_correct": "1" if is_correct else "0",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    COLLECTED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = COLLECTED_DATA_DIR / f".metadata_{os.getpid()}.tmp"
+    with temporary.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for row_id in sorted(rows):
+            writer.writerow(rows[row_id])
+    temporary.replace(COLLECTED_METADATA_PATH)
+
+
+def _commit_collected_sample(
+    scan_id: int,
+    corrected_key: str,
+    predicted_key: str,
+    is_correct: bool,
+) -> dict[str, Any]:
+    """Promote a staged image into the confirmed real-world dataset."""
+    if not DATASET_COLLECTION_ENABLED:
+        return {"enabled": False, "saved": False, "image_path": None}
+    if corrected_key not in RULE_BY_KEY:
+        return {"enabled": True, "saved": False, "image_path": None}
+
+    filename = f"scan_{scan_id}.jpg"
+    pending = COLLECTED_PENDING_DIR / filename
+    target_dir = COLLECTED_DATA_DIR / corrected_key
+    target = target_dir / filename
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        existing = _collection_sample_candidates(scan_id)
+        source: Path | None = pending if pending.is_file() else (existing[0] if existing else None)
+        if source is None:
+            return {"enabled": True, "saved": False, "image_path": None}
+
+        if source != target:
+            if target.exists():
+                target.unlink()
+            source.replace(target)
+
+        # Remove any stale copy left in a class directory after a label edit.
+        for stale in _collection_sample_candidates(scan_id):
+            if stale != target:
+                stale.unlink(missing_ok=True)
+
+        _update_collection_metadata(
+            scan_id,
+            label=corrected_key,
+            predicted_key=predicted_key,
+            is_correct=is_correct,
+            image_path=target,
+        )
+        return {
+            "enabled": True,
+            "saved": True,
+            "image_path": target.relative_to(COLLECTED_DATA_DIR).as_posix(),
+        }
+    except OSError:
+        logger.exception("Could not promote collected dataset image for scan_id=%s", scan_id)
+        return {"enabled": True, "saved": False, "image_path": None}
+
+
+def _delete_pending_collection_image(scan_id: int) -> int:
+    path = COLLECTED_PENDING_DIR / f"scan_{scan_id}.jpg"
+    try:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            return 1
+    except OSError:
+        logger.warning("Could not delete pending dataset image: %s", path, exc_info=True)
+    return 0
+
+
+def _delete_all_pending_collection_images() -> int:
+    deleted = 0
+    try:
+        candidates = list(COLLECTED_PENDING_DIR.glob("scan_*.jpg"))
+    except OSError:
+        return 0
+    for path in candidates:
+        try:
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                deleted += 1
+        except OSError:
+            logger.warning("Could not delete pending dataset image: %s", path, exc_info=True)
+    return deleted
 
 
 def _thumbnail_path(filename: str) -> Path | None:
@@ -177,80 +356,31 @@ def _thumbnail_path(filename: str) -> Path | None:
         return None
 
 
-def _exact_scan_thumbnail_path(scan_id: int) -> Path | None:
-    if scan_id <= 0:
-        return None
-    return _thumbnail_path(f"scan_{scan_id}.jpg")
-
-
-def _recoverable_exact_scan_thumbnail_path(
-    scan_id: int,
-    tombstones: dict[int, str] | None = None,
-    last_clear_at: str | None = None,
-) -> Path | None:
-    """Return scan_<id>.jpg only when delete/clear recovery barriers allow it."""
-    path = _exact_scan_thumbnail_path(scan_id)
-    if path is None:
-        return None
-    try:
-        active_tombstones = (
-            tombstones if tombstones is not None else list_scan_recovery_tombstones()
-        )
-        active_last_clear = (
-            last_clear_at if tombstones is not None else get_history_clear_timestamp()
-        )
-    except sqlite3.Error:
-        logger.warning(
-            "Could not validate thumbnail recovery barrier for scan_id=%s",
-            scan_id,
-            exc_info=True,
-        )
-        return None
-    return (
-        path
-        if _thumbnail_is_recoverable(
-            scan_id, path, active_tombstones, active_last_clear
-        )
-        else None
-    )
-
-
 def _delete_thumbnail_files(filenames: list[str]) -> int:
-    """Delete specific thumbnails only inside this database namespace.
-
-    Legacy scan_<id>.jpg files are intentionally never deleted here because a
-    legacy filename does not prove which database originally owned the image.
-    Legacy cleanup must therefore be an explicit migration/maintenance action.
-    """
     deleted = 0
     for filename in set(filenames):
         if not filename or Path(filename).name != filename:
             continue
         path = SCAN_THUMBNAIL_DIR / filename
         try:
-            if not path.is_file() and not path.is_symlink():
-                continue
-            path.unlink()
-            deleted += 1
+            if path.is_file() or path.is_symlink():
+                path.unlink()
+                deleted += 1
         except OSError:
             logger.warning("Could not delete thumbnail: %s", path, exc_info=True)
     return deleted
 
 
 def _delete_all_managed_thumbnail_files() -> int:
-    """Delete managed thumbnails only inside this database namespace."""
     deleted = 0
     try:
         candidates = list(SCAN_THUMBNAIL_DIR.iterdir())
     except FileNotFoundError:
         return 0
     except OSError:
-        logger.warning(
-            "Could not inspect thumbnail directory: %s",
-            SCAN_THUMBNAIL_DIR,
-            exc_info=True,
-        )
+        logger.warning("Could not inspect thumbnail directory: %s", SCAN_THUMBNAIL_DIR, exc_info=True)
         return 0
+
     for path in candidates:
         name = path.name
         managed = (
@@ -269,231 +399,6 @@ def _delete_all_managed_thumbnail_files() -> int:
     return deleted
 
 
-def _parse_deleted_at(value: str) -> datetime | None:
-    try:
-        parsed = datetime.fromisoformat(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _thumbnail_is_recoverable(
-    scan_id: int,
-    path: Path,
-    tombstones: dict[int, str],
-    last_clear_at: str | None,
-) -> bool:
-    """Reject stale JPEGs left behind by explicit delete/clear operations.
-
-    A tombstone is permanent for that scan id. Filesystem mtimes are not trusted
-    to resurrect an explicitly deleted id because copied/restored files can carry
-    timestamps newer than the delete itself.
-    """
-    if scan_id in tombstones:
-        return False
-
-    clear_barrier = _parse_deleted_at(last_clear_at or "")
-    if clear_barrier is None:
-        return True
-    try:
-        modified_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    except OSError:
-        return False
-    return modified_at > clear_barrier
-
-def _recover_unlinked_thumbnail_rows() -> int:
-    """Reconnect exact namespaced scan_<id>.jpg files to existing rows."""
-    try:
-        missing_ids = list_scan_ids_without_thumbnail()
-        tombstones = list_scan_recovery_tombstones()
-        last_clear_at = get_history_clear_timestamp()
-    except sqlite3.Error:
-        logger.exception("Could not inspect unlinked thumbnail rows")
-        return 0
-
-    recovered = 0
-    for scan_id in missing_ids:
-        filename = f"scan_{scan_id}.jpg"
-        candidate = SCAN_THUMBNAIL_DIR / filename
-        try:
-            if not candidate.is_file():
-                continue
-        except OSError:
-            logger.warning(
-                "Could not inspect thumbnail candidate for scan_id=%s",
-                scan_id,
-                exc_info=True,
-            )
-            continue
-        if not _thumbnail_is_recoverable(scan_id, candidate, tombstones, last_clear_at):
-            continue
-        try:
-            if recover_scan_thumbnail_name(scan_id, filename):
-                recovered += 1
-        except sqlite3.Error:
-            logger.warning(
-                "Could not reconnect thumbnail for scan_id=%s",
-                scan_id,
-                exc_info=True,
-            )
-
-    if recovered:
-        logger.info("Reconnected %s existing scan thumbnail(s) to history rows", recovered)
-    return recovered
-
-def _recover_missing_tail_scan_rows() -> int:
-    """Restore a contiguous missing history tail from namespaced thumbnails.
-
-    Explicitly deleted ids are permanently protected by DB tombstones.
-    """
-    try:
-        max_scan_id = get_max_scan_id()
-        tombstones = list_scan_recovery_tombstones()
-        last_clear_at = get_history_clear_timestamp()
-    except sqlite3.Error:
-        logger.exception("Could not inspect history tail for thumbnail recovery")
-        return 0
-
-    files_by_id: dict[int, Path] = {}
-    try:
-        candidates = list(SCAN_THUMBNAIL_DIR.iterdir())
-    except FileNotFoundError:
-        candidates = []
-    except OSError:
-        logger.warning(
-            "Could not inspect recovery directory: %s",
-            SCAN_THUMBNAIL_DIR,
-            exc_info=True,
-        )
-        return 0
-
-    for path in candidates:
-        name = path.name
-        if not (name.startswith("scan_") and name.endswith(".jpg")):
-            continue
-        raw_id = name[len("scan_") : -len(".jpg")]
-        if raw_id.isdigit():
-            files_by_id[int(raw_id)] = path
-
-    recovered = 0
-    next_id = max_scan_id + 1
-    max_file_id = max(files_by_id, default=0)
-    while next_id <= max_file_id:
-        path = files_by_id.get(next_id)
-        if path is None:
-            # A missing id is safe to cross only when the DB remembers that the user
-            # explicitly deleted it. Any unexplained gap still ends tail recovery.
-            if next_id in tombstones:
-                next_id += 1
-                continue
-            break
-        if not _thumbnail_is_recoverable(
-            next_id, path, tombstones, last_clear_at
-        ):
-            # This id is blocked by an explicit delete or clear recovery barrier;
-            # skip the stale JPEG and keep scanning the known contiguous tail.
-            next_id += 1
-            continue
-        try:
-            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
-            if recover_missing_scan_from_thumbnail(next_id, path.name, modified):
-                recovered += 1
-        except (OSError, sqlite3.Error):
-            logger.warning(
-                "Could not restore missing history row for scan_id=%s",
-                next_id,
-                exc_info=True,
-            )
-            break
-        next_id += 1
-
-    if recovered:
-        logger.warning(
-            "Recovered %s missing history row(s) from contiguous namespaced thumbnails; "
-            "labels/confidence are intentionally marked unknown",
-            recovered,
-        )
-    return recovered
-
-def _migrate_legacy_thumbnails() -> int:
-    """Optionally copy legacy shared thumbnails into this DB namespace.
-
-    Disabled by default because a shared legacy scan_<id>.jpg filename cannot prove
-    which database originally owned the image. Enable only for a known single-DB
-    upgrade where the legacy directory is trusted.
-    """
-    if (
-        not MIGRATE_LEGACY_THUMBNAILS
-        or _SCAN_THUMBNAIL_DIR_ENV
-        or SCAN_THUMBNAIL_DIR == LEGACY_SCAN_THUMBNAIL_DIR
-    ):
-        return 0
-
-    try:
-        referenced = list_all_scan_thumbnail_names()
-        if not referenced or not LEGACY_SCAN_THUMBNAIL_DIR.exists():
-            return 0
-        SCAN_THUMBNAIL_DIR.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        logger.exception("Could not prepare legacy thumbnail migration")
-        return 0
-
-    migrated = 0
-    for filename in referenced:
-        source = LEGACY_SCAN_THUMBNAIL_DIR / filename
-        target = SCAN_THUMBNAIL_DIR / filename
-        try:
-            if target.is_file():
-                continue
-            if not source.is_file():
-                continue
-            # Copy rather than move: another legacy database may still refer to
-            # the same shared path. New writes are isolated in the namespaced
-            # folder, so leaving the old source is the safest upgrade path.
-            target.write_bytes(source.read_bytes())
-            migrated += 1
-        except OSError:
-            logger.warning("Could not migrate legacy thumbnail: %s", source, exc_info=True)
-    if migrated:
-        logger.info("Migrated %s legacy thumbnail(s) into %s", migrated, SCAN_THUMBNAIL_DIR)
-    return migrated
-
-
-def _cleanup_orphan_thumbnails() -> int:
-    """Delete scanner thumbnails that are no longer referenced by this database."""
-    try:
-        referenced = set(list_all_scan_thumbnail_names())
-        candidates = list(SCAN_THUMBNAIL_DIR.iterdir())
-    except FileNotFoundError:
-        return 0
-    except (OSError, sqlite3.Error):
-        logger.exception("Could not inspect scan thumbnails for orphan cleanup")
-        return 0
-
-    deleted = 0
-    for path in candidates:
-        name = path.name
-        is_managed_thumbnail = (
-            name.startswith("scan_")
-            and name.endswith(".jpg")
-            and name[len("scan_") : -len(".jpg")].isdigit()
-        )
-        if not is_managed_thumbnail or name in referenced:
-            continue
-        try:
-            if path.is_file() or path.is_symlink():
-                path.unlink()
-                deleted += 1
-        except OSError:
-            logger.warning("Could not delete orphan thumbnail: %s", path, exc_info=True)
-
-    if deleted:
-        logger.info("Deleted %s orphan scan thumbnail(s)", deleted)
-    return deleted
-
-
 async def _preload_classifier() -> None:
     # Let the web UI become responsive first, then warm the heavy model in the
     # background so the first scan usually avoids model-load latency.
@@ -507,32 +412,6 @@ async def _preload_classifier() -> None:
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     initialize_database()
-    migrated_embeddings = 0
-    for source_kind, target_kind, dimension in classifier.legacy_embedding_migrations():
-        migrated_embeddings += await run_in_threadpool(
-            migrate_legacy_embedding_kind,
-            source_kind,
-            target_kind,
-            dimension,
-        )
-    app_.state.legacy_embeddings_migrated = migrated_embeddings
-    if migrated_embeddings:
-        logger.info("Migrated %s compatible legacy feedback embedding(s)", migrated_embeddings)
-    # Legacy files are consulted only during this explicit-reference migration.
-    # All normal reads/recovery below are namespaced to the current database.
-    app_.state.legacy_thumbnails_migrated = await run_in_threadpool(
-        _migrate_legacy_thumbnails
-    )
-    app_.state.thumbnail_links_recovered = await run_in_threadpool(
-        _recover_unlinked_thumbnail_rows
-    )
-    app_.state.missing_history_rows_recovered = await run_in_threadpool(
-        _recover_missing_tail_scan_rows
-    )
-    # Do not delete unreferenced JPEGs automatically at startup. An orphan can be
-    # the only surviving evidence of a row lost when a WAL file was not copied.
-    # Managed thumbnails are deleted only by the explicit DELETE /api/history flow.
-    app_.state.orphan_thumbnails_deleted = 0
     preload_task = asyncio.create_task(_preload_classifier()) if PRELOAD_MODEL else None
     app_.state.model_preload_task = preload_task
     yield
@@ -543,7 +422,7 @@ async def lifespan(app_: FastAPI):
 app = FastAPI(
     title="Waste Scanner AI",
     description="Ứng dụng quét và phân loại rác bằng camera.",
-    version="1.10.6",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -562,19 +441,19 @@ async def disable_ui_cache(request, call_next):
     return response
 
 
-@app.get("/api/health")
-def health() -> JSONResponse:
+def _service_status_payload() -> dict[str, Any]:
     classifier_status = classifier.status
     state = classifier_status["state"]
-    # A retry window expiring does not mean the classifier recovered; only a
-    # successful model load can move it back to a healthy state. Keep reporting
-    # degraded until that actually happens so external health checks do not flip
-    # to green merely because another retry is allowed.
-    degraded = state in {"error", "retry_available"}
-    payload = {
-        "status": "degraded" if degraded else "ok",
+    if state == "ready":
+        status = "ok"
+    elif state in {"error", "retry_available"}:
+        status = "degraded"
+    else:
+        status = "starting"
+    return {
+        "status": status,
         "app": "waste-scanner-ai",
-        "version": "1.10.6",
+        "version": "2.0.0",
         "launch_token": os.getenv("WASTE_SCANNER_LAUNCH_TOKEN", ""),
         "pid": os.getpid(),
         "ready": state == "ready",
@@ -582,11 +461,27 @@ def health() -> JSONResponse:
         "classifier": classifier_status,
         "learning": {
             "enabled": LEARNING_ENABLED,
-            "mode": "shared-feedback-knn",
+            "mode": "shared-feedback-knn-11class",
             "max_examples": LEARNING_MAX_EXAMPLES,
         },
+        "dataset_collection": {
+            "enabled": DATASET_COLLECTION_ENABLED,
+            "directory": str(COLLECTED_DATA_DIR),
+        },
     }
-    return JSONResponse(status_code=503 if degraded else 200, content=payload)
+
+
+@app.get("/api/health")
+def health() -> JSONResponse:
+    """Liveness endpoint: HTTP 200 means the FastAPI process is alive."""
+    return JSONResponse(status_code=200, content=_service_status_payload())
+
+
+@app.get("/api/ready")
+def readiness() -> JSONResponse:
+    """Readiness endpoint: HTTP 200 only after the AI model is usable."""
+    payload = _service_status_payload()
+    return JSONResponse(status_code=200 if payload["ready"] else 503, content=payload)
 
 
 @app.get("/api/categories")
@@ -635,7 +530,8 @@ async def classify_image(
             source.verify()
 
         with Image.open(io.BytesIO(content)) as source:
-            pil_image = ImageOps.exif_transpose(source).convert("RGB")
+            collection_image = ImageOps.exif_transpose(source).convert("RGB")
+            pil_image = collection_image.copy()
             pil_image.thumbnail(
                 (CLASSIFIER_IMAGE_MAX_DIMENSION, CLASSIFIER_IMAGE_MAX_DIMENSION),
                 Image.Resampling.LANCZOS,
@@ -677,9 +573,13 @@ async def classify_image(
         )
 
     rule = RULE_BY_KEY[result.key]
+    base_rule = RULE_BY_KEY[base_result.key]
+    memory_info = result.analysis.get("learning_memory", {})
+    memory_applied = bool(memory_info.get("applied"))
     stored_category = "Chưa xác định" if result.uncertain else rule.category
     thumbnail_stored = False
     embedding_stored = False
+    collection_pending_stored = False
     history_saved = False
     scan_id: int | None = None
     async with history_mutation_gate:
@@ -688,8 +588,13 @@ async def classify_image(
             rule.key,
             rule.display_name,
             stored_category,
-            result.confidence,
+            base_result.confidence,
             result.uncertain,
+            base_result.key,
+            base_result.confidence,
+            base_result.uncertain,
+            result.confidence,
+            memory_applied,
             history_scope,
             history_generation,
         )
@@ -701,6 +606,12 @@ async def classify_image(
                 history_scope,
                 pil_image,
             )
+            if DATASET_COLLECTION_ENABLED:
+                collection_pending_stored = await run_in_threadpool(
+                    _save_pending_collection_image,
+                    scan_id,
+                    collection_image,
+                )
             if LEARNING_ENABLED and result.embedding and result.embedding_kind:
                 try:
                     embedding_stored = await run_in_threadpool(
@@ -722,12 +633,13 @@ async def classify_image(
         # from the pre-clear generation influence the visible post-clear result.
         result = base_result
         rule = RULE_BY_KEY[result.key]
+        base_rule = rule
+        memory_info = result.analysis.get("learning_memory", {})
+        memory_applied = False
         scan_id = None
         thumbnail_stored = False
         embedding_stored = False
-
-    memory_info = result.analysis.get("learning_memory", {})
-    memory_applied = bool(memory_info.get("applied"))
+        collection_pending_stored = False
 
     if result.uncertain:
         notice = (
@@ -760,10 +672,33 @@ async def classify_image(
         "scan_id": scan_id,
         "history_saved": history_saved,
         **public_rule,
+        # Keep the top-level prediction internally consistent: identity, score,
+        # alternatives and uncertainty all describe the effective result after
+        # feedback-memory fusion. The original calibrated model prediction is
+        # preserved separately under ``model_prediction``.
         "predicted_category": rule.category,
         "confidence": result.confidence,
         "uncertain": result.uncertain,
+        "model_uncertain": base_result.uncertain,
         "alternatives": result.alternatives,
+        "model_prediction": {
+            "key": base_result.key,
+            "display_name": base_rule.display_name,
+            "category": base_rule.category,
+            "confidence": base_result.confidence,
+            "uncertain": base_result.uncertain,
+            "alternatives": base_result.alternatives,
+        },
+        "effective_prediction": {
+            "key": result.key,
+            "display_name": rule.display_name,
+            "category": rule.category,
+            "score": result.confidence,
+            "uncertain": result.uncertain,
+            "alternatives": result.alternatives,
+            "memory_applied": memory_applied,
+        },
+        "effective_score": result.confidence,
         "analysis": result.analysis,
         "learning": {
             "enabled": LEARNING_ENABLED,
@@ -772,6 +707,11 @@ async def classify_image(
             "matched_examples": int(memory_info.get("matched_examples", 0)),
         },
         "history_thumbnail_available": thumbnail_stored,
+        "dataset_collection": {
+            "enabled": DATASET_COLLECTION_ENABLED,
+            "pending": collection_pending_stored,
+            "saved": False,
+        },
         "notice": notice,
     }
 
@@ -784,22 +724,33 @@ async def submit_feedback(
     if correct_key not in RULE_BY_KEY:
         raise HTTPException(status_code=400, detail="Loại rác phản hồi không hợp lệ.")
 
+    collection_result: dict[str, Any] = {
+        "enabled": DATASET_COLLECTION_ENABLED,
+        "saved": False,
+        "image_path": None,
+    }
     async with history_mutation_gate:
         saved = await run_in_threadpool(
             record_feedback,
             payload.scan_id,
             correct_key,
         )
+        if saved is not None and DATASET_COLLECTION_ENABLED:
+            collection_result = await run_in_threadpool(
+                _commit_collected_sample,
+                payload.scan_id,
+                correct_key,
+                str(saved["predicted_key"]),
+                bool(saved["is_correct"]),
+            )
     if saved is None:
         raise HTTPException(status_code=404, detail="Không tìm thấy lần quét này trong lịch sử dùng chung.")
 
     compatible_kinds = classifier.learning_embedding_kinds()
     embedding_kind = saved.get("embedding_kind")
-    feedback_kind = str(saved.get("feedback_kind") or "evaluation")
     has_embedding = bool(embedding_kind)
     learnable = bool(
-        feedback_kind == "evaluation"
-        and correct_key in LEARNABLE_RULE_KEYS
+        correct_key in LEARNABLE_RULE_KEYS
         and has_embedding
         and embedding_kind in compatible_kinds
     )
@@ -815,16 +766,8 @@ async def submit_feedback(
         statistics = {}
     target_rule = RULE_BY_KEY[correct_key]
     target_name = target_rule.display_name
-    if feedback_kind == "assignment":
-        message = (
-            f"Đã gán nhãn cho ảnh khôi phục: {target_name}. "
-            "Bản ghi này không được tính là một lần AI đoán đúng/sai."
-        )
-    elif correct_key not in LEARNABLE_RULE_KEYS:
-        message = (
-            f"Đã lưu phản hồi: {target_name}. Nhóm này là nhãn dự phòng nên không được "
-            "dùng làm mẫu học để tránh AI biến 'Rác còn lại' thành một lớp nhận dạng trực tiếp."
-        )
+    if correct_key not in LEARNABLE_RULE_KEYS:
+        message = f"Đã lưu phản hồi: {target_name}, nhưng nhãn này không thuộc schema model hiện tại."
     elif learnable and LEARNING_ENABLED:
         message = f"Đã ghi nhớ phản hồi: {target_name}. Các ảnh tương tự sau này có thể dùng mẫu này để điều chỉnh kết quả."
     elif not has_embedding:
@@ -834,12 +777,18 @@ async def submit_feedback(
     else:
         message = f"Đã lưu phản hồi: {target_name}. Chức năng học từ phản hồi hiện đang tắt nên mẫu này chưa được dùng để điều chỉnh các lần quét sau."
 
+    if collection_result.get("saved"):
+        message += " Ảnh đã được lưu vào bộ dữ liệu thực tế để dùng cho lần fine-tune sau."
+    elif DATASET_COLLECTION_ENABLED:
+        message += " Không tìm thấy ảnh nguồn để thêm vào bộ dữ liệu thực tế (có thể đây là lịch sử tạo trước bản cập nhật này)."
+
     return {
         **saved,
         **target_rule.public_dict(),
         "learnable": learnable,
         "learning_enabled": LEARNING_ENABLED,
         "statistics": statistics,
+        "dataset_collection": collection_result,
         "message": message,
     }
 
@@ -861,35 +810,11 @@ def history(
 ) -> dict[str, Any]:
     page = get_history_page(limit, before_id, q)
     items = page["items"]
-
-    # A filename stored in SQLite is only a reference, not proof that the JPEG
-    # still exists. Validate every linked thumbnail against the filesystem before
-    # advertising it to the frontend. Unlinked rows may still use the guarded
-    # exact-name recovery path.
-    needs_recovery_check = any(not item.get("_thumbnail_name") for item in items)
-    tombstones: dict[int, str] | None = None
-    last_clear_at: str | None = None
-    recovery_barriers_loaded = True
-    if needs_recovery_check:
-        try:
-            tombstones = list_scan_recovery_tombstones()
-            last_clear_at = get_history_clear_timestamp()
-        except sqlite3.Error:
-            logger.warning("Could not load thumbnail recovery barriers for history", exc_info=True)
-            recovery_barriers_loaded = False
-
     for item in items:
-        linked_thumbnail = item.pop("_thumbnail_name", None)
-        if linked_thumbnail:
-            item["thumbnail_available"] = _thumbnail_path(str(linked_thumbnail)) is not None
-        else:
-            item["thumbnail_available"] = bool(
-                recovery_barriers_loaded
-                and _recoverable_exact_scan_thumbnail_path(
-                    int(item["id"]), tombstones, last_clear_at
-                )
-                is not None
-            )
+        thumbnail_name = item.pop("_thumbnail_name", None)
+        item["thumbnail_available"] = bool(
+            thumbnail_name and _thumbnail_path(str(thumbnail_name)) is not None
+        )
     next_cursor = items[-1]["id"] if items and page["has_more"] else None
     return {
         "items": items,
@@ -905,25 +830,15 @@ def history(
 
 
 @app.get("/api/history/{scan_id}/thumbnail")
-def history_thumbnail(
-    scan_id: int,
-) -> FileResponse:
+def history_thumbnail(scan_id: int) -> FileResponse:
     exists, filename = get_scan_thumbnail_state(scan_id)
     if not exists:
         raise HTTPException(status_code=404, detail="Không tìm thấy lần quét này trong lịch sử.")
-    fallback_thumbnail = filename is None
-    if fallback_thumbnail:
-        filename = f"scan_{scan_id}.jpg"
-        path = _recoverable_exact_scan_thumbnail_path(scan_id)
-    else:
-        path = _thumbnail_path(filename)
+    if not filename:
+        raise HTTPException(status_code=404, detail="Lần quét này không có ảnh xem trước.")
+    path = _thumbnail_path(filename)
     if path is None:
         raise HTTPException(status_code=404, detail="Ảnh xem trước không còn tồn tại.")
-    if fallback_thumbnail:
-        try:
-            recover_scan_thumbnail_name(scan_id, filename)
-        except sqlite3.Error:
-            logger.warning("Could not relink thumbnail for scan_id=%s", scan_id, exc_info=True)
     return FileResponse(
         path,
         media_type="image/jpeg",
@@ -932,9 +847,13 @@ def history_thumbnail(
 
 
 @app.delete("/api/history/{scan_id}")
-async def delete_history_item(scan_id: int) -> dict[str, Any]:
+async def delete_history_item(
+    scan_id: int,
+    delete_password: Annotated[str | None, Header(alias="X-Delete-Password")] = None,
+) -> dict[str, Any]:
     if scan_id <= 0:
         raise HTTPException(status_code=400, detail="ID lần quét không hợp lệ.")
+    _require_history_delete_password(delete_password)
 
     async with history_mutation_gate:
         deleted = await run_in_threadpool(delete_scan, scan_id)
@@ -946,11 +865,15 @@ async def delete_history_item(scan_id: int) -> dict[str, Any]:
         if linked_thumbnail:
             filenames.append(str(linked_thumbnail))
         thumbnails_deleted = await run_in_threadpool(_delete_thumbnail_files, filenames)
+        pending_dataset_images_deleted = await run_in_threadpool(
+            _delete_pending_collection_image, scan_id
+        )
 
     return {
         "deleted": 1,
         "scan_id": scan_id,
         "thumbnails_deleted": thumbnails_deleted,
+        "pending_dataset_images_deleted": pending_dataset_images_deleted,
         "remaining": int(deleted["remaining"]),
         "sequence_reset": False,
         "next_scan_id": None,
@@ -958,16 +881,20 @@ async def delete_history_item(scan_id: int) -> dict[str, Any]:
 
 
 @app.delete("/api/history")
-async def delete_history() -> dict[str, Any]:
+async def delete_history(
+    delete_password: Annotated[str | None, Header(alias="X-Delete-Password")] = None,
+) -> dict[str, Any]:
+    _require_history_delete_password(delete_password)
     async with history_mutation_gate:
         deleted = await run_in_threadpool(clear_scans)
-        # Runtime deletion is restricted to this database's thumbnail namespace.
-        # The shared legacy root may contain scan_<id>.jpg files owned by another
-        # database, so it must never be cleaned implicitly from this endpoint.
         thumbnails_deleted = await run_in_threadpool(_delete_all_managed_thumbnail_files)
+        pending_dataset_images_deleted = await run_in_threadpool(
+            _delete_all_pending_collection_images
+        )
     return {
         "deleted": deleted,
         "thumbnails_deleted": thumbnails_deleted,
+        "pending_dataset_images_deleted": pending_dataset_images_deleted,
         "sequence_reset": False,
         "next_scan_id": None,
     }

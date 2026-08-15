@@ -97,6 +97,12 @@ if not "%EXIT_CODE%"=="0" pause
 exit /b %EXIT_CODE%
 
 :ngrok
+"%VENV_PYTHON%" -c "import pyngrok" >nul 2>nul
+if errorlevel 1 (
+  echo Dang cai pyngrok cho che do ngrok...
+  "%VENV_PYTHON%" -m pip install "pyngrok>=8.1,<9.0"
+  if errorlevel 1 goto :error
+)
 "%VENV_PYTHON%" launcher.py --ngrok
 set "EXIT_CODE=%errorlevel%"
 if not "%EXIT_CODE%"=="0" pause

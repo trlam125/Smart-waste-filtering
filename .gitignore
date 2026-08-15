@@ -34,3 +34,8 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Trained models / experiment outputs
+models/*.pt
+runs/
+

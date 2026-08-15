@@ -84,7 +84,7 @@ function isValidClientId(value) {
   return Boolean(
     normalized
     && normalized.length <= 128
-    && !['anonymous', 'legacy'].includes(normalized.toLowerCase())
+    && normalized.toLowerCase() !== 'anonymous'
   );
 }
 
@@ -275,7 +275,7 @@ async function refreshHealth() {
     const state = payload.classifier?.state || (response.ok ? 'not_loaded' : 'error');
 
     if (state === 'ready') {
-      renderHealthStatus('ready', 'AI sẵn sàng', `Mô hình: ${payload.classifier?.model || 'đã nạp'}`);
+      renderHealthStatus('ready', 'AI sẵn sàng', `Mô hình: ${payload.classifier?.architecture || payload.classifier?.model_type || 'đã nạp'}`);
     } else if (state === 'loading') {
       renderHealthStatus('checking', 'AI đang tải', 'Mô hình AI đang được nạp nền để lần quét đầu nhanh hơn.');
     } else if (state === 'not_loaded') {
@@ -613,6 +613,24 @@ async function postFeedback(scanId, correctKey) {
   return payload;
 }
 
+function updateResultConfidenceLabel(result) {
+  const label = document.getElementById('resultConfidenceLabel');
+  if (!label) return;
+  const correctedPrediction = Boolean(result?.corrected_key) && result?.is_correct === false;
+  const memoryAdjusted = Boolean(
+    result?.learning?.memory_applied || result?.effective_prediction?.memory_applied
+  );
+  if (correctedPrediction) {
+    label.textContent = memoryAdjusted
+      ? 'Điểm phù hợp trước khi bạn sửa'
+      : 'Độ tin cậy dự đoán AI ban đầu';
+  } else {
+    label.textContent = memoryAdjusted
+      ? 'Điểm phù hợp sau bộ nhớ'
+      : 'Mức phù hợp AI';
+  }
+}
+
 function applyFeedbackResult(payload) {
   if (!currentResult || !payload?.corrected_key) return;
 
@@ -634,6 +652,7 @@ function applyFeedbackResult(payload) {
   document.getElementById('resultName').textContent = currentResult.display_name;
   document.getElementById('resultBin').textContent = currentResult.bin_name;
   document.getElementById('resultInstruction').textContent = currentResult.instruction;
+  updateResultConfidenceLabel(currentResult);
 }
 
 async function submitFeedback(correctKey) {
@@ -698,6 +717,7 @@ function renderResult(result) {
 
   const percentage = Math.round(result.confidence * 100);
   document.getElementById('resultConfidence').textContent = `${percentage}%`;
+  updateResultConfidenceLabel(result);
   
   // Radial Gauge Animation
   const gaugeProgress = document.getElementById('gaugeProgress');
@@ -769,8 +789,8 @@ async function processSelectedFile(file) {
 
 // --- Sample Quick Tests ---
 const SAMPLES = {
-  plastic: '/static/samples/plastic-bottle.jpg',
-  paper: '/static/samples/cardboard-box.jpg',
+  plastic_rigid: '/static/samples/plastic-bottle.jpg',
+  cardboard: '/static/samples/cardboard-box.jpg',
   metal: '/static/samples/aluminum-can.jpg',
   organic: '/static/samples/fruit-peel.jpg'
 };
@@ -804,7 +824,7 @@ async function loadCatalog() {
     populateFeedbackCategories(currentResult?.corrected_key || currentResult?.key || '');
     // History can finish loading before the catalog request. Re-render once the
     // localized category names are available so corrected keys never remain as
-    // raw values such as "paper" or "plastic" until the next refresh.
+    // raw sample ids until the next refresh.
     if (cachedHistoryItems.length) renderHistoryItems(cachedHistoryItems);
     
     catalogGrid.replaceChildren(...catalogItems.map(item => {
@@ -957,41 +977,33 @@ async function openHistoryEditor(item) {
   if (!catalogItems.length) await loadCatalog();
   historyEditItem = item;
   const effectiveKey = item.corrected_key || item.waste_key;
-  populateCategorySelect(historyEditCategory, item.recovered && !item.corrected_key ? '' : effectiveKey);
-  if (item.recovered && !item.corrected_key && historyEditCategory) {
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = '— Chọn nhãn đúng —';
-    placeholder.disabled = true;
-    placeholder.selected = true;
-    historyEditCategory.prepend(placeholder);
-  }
+  populateCategorySelect(historyEditCategory, effectiveKey);
 
   if (historyEditObjectName) {
-    historyEditObjectName.textContent = item.recovered ? `Ảnh khôi phục #${item.id}` : item.display_name;
+    historyEditObjectName.textContent = item.display_name;
   }
+  const modelDisplayName = item.model_display_name || item.display_name;
+  const modelCategory = item.model_category || item.category;
+  const modelUncertain = item.model_uncertain ?? item.uncertain;
+  const modelConfidence = Number(item.model_confidence ?? item.confidence ?? 0);
   if (historyEditPredicted) {
-    historyEditPredicted.textContent = item.recovered
-      ? 'Không khôi phục được nhãn AI ban đầu'
-      : `${item.display_name} · ${item.category}${item.uncertain ? ' · AI chưa chắc chắn' : ''}`;
+    historyEditPredicted.textContent = `${modelDisplayName} · ${modelCategory}${modelUncertain ? ' · AI chưa chắc chắn' : ''}`;
   }
   if (historyEditConfidence) {
-    historyEditConfidence.textContent = item.recovered
-      ? 'Không có'
-      : `${item.uncertain ? '~' : ''}${Math.round(item.confidence * 100)}%`;
+    historyEditConfidence.textContent = `${modelUncertain ? '~' : ''}${Math.round(modelConfidence * 100)}%`;
   }
   if (historyEditTime) historyEditTime.textContent = formatDate(item.created_at);
   if (historyEditCurrentLabel) {
     historyEditCurrentLabel.textContent = item.corrected_key
       ? displayNameForKey(item.corrected_key)
-      : (item.recovered ? 'Chưa xác nhận' : 'Chưa xác nhận · đang dùng dự đoán AI');
+      : (item.memory_applied
+          ? 'Chưa xác nhận · đang dùng kết quả sau bộ nhớ học'
+          : 'Chưa xác nhận · đang dùng dự đoán AI');
   }
   if (historyEditStatus) {
-    historyEditStatus.textContent = item.recovered
-      ? 'Ảnh này được khôi phục từ data/scans sau khi DB bị thiếu phần đuôi lịch sử. Hãy xem ảnh và chọn nhãn đúng; bản ghi khôi phục không có embedding cũ để dùng làm mẫu học.'
-      : (item.thumbnail_available
-        ? 'Đối chiếu ảnh rồi chọn nhãn đúng. Lưu lại sẽ cập nhật ngay bộ nhớ học.'
-        : 'Bản ghi này không còn thumbnail. Bạn vẫn có thể sửa nhãn nếu nhận ra lần quét từ thông tin bên cạnh.');
+    historyEditStatus.textContent = item.thumbnail_available
+      ? 'Đối chiếu ảnh rồi chọn nhãn đúng. Lưu lại sẽ cập nhật ngay bộ nhớ học.'
+      : 'Bản ghi này không còn thumbnail. Bạn vẫn có thể sửa nhãn nếu nhận ra lần quét từ thông tin bên cạnh.';
   }
   if (historyEditImage) {
     historyEditImage.removeAttribute('src');
@@ -1054,18 +1066,33 @@ async function saveHistoryEdit() {
   }
 }
 
+function requestHistoryDeletePassword() {
+  const password = window.prompt('Nhập mật khẩu xóa lịch sử (HISTORY_DELETE_PASSWORD trong file .env):');
+  if (password === null) return null;
+  if (!password.trim()) {
+    showToast('Bạn phải nhập mật khẩu để xóa lịch sử.');
+    return null;
+  }
+  return password;
+}
+
 async function deleteHistoryItem(item) {
   if (!item?.id || isBusy || isHistoryBusy || feedbackSubmitting) return;
 
-  const itemName = item.recovered ? `Ảnh khôi phục #${item.id}` : item.display_name;
+  const itemName = item.display_name;
   const confirmed = window.confirm(
     `Xóa “${itemName}” khỏi lịch sử? Ảnh, phản hồi và dữ liệu học của riêng lần quét này cũng sẽ bị xóa. Thao tác này không thể hoàn tác.`
   );
   if (!confirmed) return;
+  const deletePassword = requestHistoryDeletePassword();
+  if (deletePassword === null) return;
 
   setHistoryBusy(true);
   try {
-    const response = await fetch(`/api/history/${item.id}`, { method: 'DELETE' });
+    const response = await fetch(`/api/history/${item.id}`, {
+      method: 'DELETE',
+      headers: { 'X-Delete-Password': deletePassword }
+    });
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
     if (!response.ok) throw new Error(payload.detail || 'Không thể xóa lần quét này.');
@@ -1124,7 +1151,7 @@ function renderHistoryItems(items) {
     thumb.hidden = true;
     const thumbPlaceholder = document.createElement('span');
     thumbPlaceholder.className = 'history-thumb-placeholder';
-    thumbPlaceholder.textContent = item.thumbnail_available ? '…' : 'Ảnh cũ';
+    thumbPlaceholder.textContent = item.thumbnail_available ? '…' : 'Không ảnh';
     thumbButton.append(thumb, thumbPlaceholder);
     void attachHistoryThumbnail(item, thumb, thumbPlaceholder);
 
@@ -1132,17 +1159,13 @@ function renderHistoryItems(items) {
     details.className = 'history-item-info';
 
     const title = document.createElement('strong');
-    title.textContent = item.recovered ? `Ảnh khôi phục #${item.id}` : item.display_name;
+    title.textContent = item.display_name;
 
     const meta = document.createElement('small');
     const feedbackText = item.corrected_key
-      ? (item.recovered
-        ? ` · Đã gán: ${displayNameForKey(item.corrected_key)}`
-        : (item.is_correct ? ' · Đã xác nhận đúng' : ` · Đã sửa: ${displayNameForKey(item.corrected_key)}`))
+      ? (item.is_correct ? ' · Đã xác nhận đúng' : ' · Đã sửa nhãn')
       : ' · Chưa xác nhận';
-    meta.textContent = item.recovered
-      ? `Khôi phục từ ảnh · Chưa có nhãn AI${feedbackText} · ${formatDate(item.created_at)}`
-      : `${item.category}${item.uncertain ? ' · Chưa chắc chắn' : ''}${feedbackText} · ${formatDate(item.created_at)}`;
+    meta.textContent = `${item.category}${item.uncertain ? ' · Chưa chắc chắn' : ''}${feedbackText} · ${formatDate(item.created_at)}`;
 
     const itemActions = document.createElement('div');
     itemActions.className = 'history-item-actions';
@@ -1165,9 +1188,17 @@ function renderHistoryItems(items) {
 
     const score = document.createElement('span');
     score.className = 'history-score';
-    score.textContent = item.recovered
-      ? '—'
-      : `${item.uncertain ? '~' : ''}${Math.round(item.confidence * 100)}%`;
+    // The list title is the current effective/user-confirmed label. Therefore a
+    // numeric score is only meaningful when it belongs to that same AI label.
+    // If the user corrected the item to another class, show correction state
+    // instead of attaching the original model confidence to the new label.
+    if (item.corrected_key && item.is_correct === false) {
+      score.textContent = 'Đã sửa';
+    } else {
+      const effectiveScore = Number(item.effective_score ?? item.confidence ?? 0);
+      const effectiveUncertain = item.effective_uncertain ?? item.uncertain;
+      score.textContent = `${effectiveUncertain ? '~' : ''}${Math.round(effectiveScore * 100)}%`;
+    }
 
     row.append(thumbButton, details, score);
     return row;
@@ -1380,10 +1411,17 @@ clearHistoryButton.addEventListener('click', async () => {
     'Xóa toàn bộ lịch sử dùng chung? Thao tác này xóa tất cả thumbnail và bộ nhớ học. ID đã dùng sẽ không được tái sử dụng để tránh ghép nhầm dữ liệu. Không thể hoàn tác.'
   );
   if (!confirmed) return;
+  const deletePassword = requestHistoryDeletePassword();
+  if (deletePassword === null) return;
   setHistoryBusy(true);
   try {
-    const response = await fetch('/api/history', { method: 'DELETE' });
-    if (!response.ok) throw new Error('Không thể xóa lịch sử.');
+    const response = await fetch('/api/history', {
+      method: 'DELETE',
+      headers: { 'X-Delete-Password': deletePassword }
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (_) { /* ignore */ }
+    if (!response.ok) throw new Error(payload.detail || 'Không thể xóa lịch sử.');
     releaseHistoryThumbnailUrls();
     closeHistoryEditor();
     // The visible result may refer to a scan that was just deleted. Keep the
