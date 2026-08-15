@@ -376,192 +376,365 @@ Then:
 
 Or run in 1 cell:
 ```
-# ================================================================
-# SMART WASTE SCANNER
-# ================================================================
-
-from google.colab import drive
-from pathlib import Path
 import os
 import sys
+import time
+import signal
+import socket
 import subprocess
-import hashlib
+from pathlib import Path
 
-drive.mount("/content/drive")
+PROJECT_DIR = Path("/content/drive/MyDrive/Colab Notebooks/Smart waste scanner")
 
-PROJECT_DIR = Path(
-    "/content/drive/MyDrive/Colab Notebooks/Smart waste scanner"
-).resolve()
+PORT = 8000
+USE_NGROK = True
+RELOAD = False
+STARTUP_TIMEOUT = 600
 
-if not PROJECT_DIR.is_dir():
-    raise FileNotFoundError(
-        f"Không tìm thấy project: {PROJECT_DIR}"
-    )
+LAUNCHER_BUILD = "2026-08-15-status-v3-port-fix"
+
+print("=" * 72)
+print("SMART WASTE SCANNER - COLAB")
+print(f"PROJECT: {PROJECT_DIR}")
+print("=" * 72)
+print(f"Launcher build: {LAUNCHER_BUILD}")
+
+if not Path("/content/drive/MyDrive").exists():
+    from google.colab import drive
+    drive.mount("/content/drive")
+else:
+    print("Google Drive da duoc mount.")
+
+if not PROJECT_DIR.exists():
+    raise FileNotFoundError(f"Khong tim thay project:\n{PROJECT_DIR}")
 
 os.chdir(PROJECT_DIR)
 
-print("=" * 72, flush=True)
-print("SMART WASTE SCANNER - COLAB", flush=True)
-print("PROJECT:", PROJECT_DIR, flush=True)
-print("=" * 72, flush=True)
+print(f"Working directory: {os.getcwd()}")
 
-launcher = PROJECT_DIR / "launcher.py"
+def port_is_busy(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(0.5)
 
-launcher_text = launcher.read_text(
-    encoding="utf-8",
-    errors="ignore",
-)
+    try:
+        result = sock.connect_ex(("127.0.0.1", port))
+        return result == 0
+    finally:
+        sock.close()
 
-EXPECTED = 'LAUNCHER_BUILD = "2026-08-15-status-v2"'
+def get_port_pids(port: int):
+    pids = set()
 
-if EXPECTED not in launcher_text:
-    raise RuntimeError(
-        "\n❌ launcher.py chưa phải bản status-v2.\n"
-        "Hãy dán đè launcher.py từ patch mới nhất rồi chạy lại."
+    try:
+        result = subprocess.run(
+            ["bash", "-lc", f"lsof -ti:{port} 2>/dev/null || true"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+    except Exception:
+        pass
+
+    if not pids:
+        try:
+            result = subprocess.run(
+                ["bash", "-lc", f"fuser {port}/tcp 2>/dev/null || true"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            for token in result.stdout.replace(":", " ").split():
+                token = token.strip()
+                if token.isdigit():
+                    pids.add(int(token))
+        except Exception:
+            pass
+
+    return sorted(pids)
+
+def get_process_info(pid: int):
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "pid=,ppid=,cmd="],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return result.stdout.strip()
+    except Exception:
+        return ""
+
+def wait_port_free(port: int, timeout: float = 10):
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        if not port_is_busy(port):
+            return True
+        time.sleep(0.25)
+
+    return not port_is_busy(port)
+
+def kill_port_processes(port: int):
+    if not port_is_busy(port):
+        print(f"Port {port} dang trong.")
+        return True
+
+    print("=" * 72)
+    print(f"PORT {port} DANG BI CHIEM")
+    print("=" * 72)
+
+    pids = get_port_pids(port)
+
+    if not pids:
+        subprocess.run(
+            ["bash", "-lc", f"fuser -k {port}/tcp 2>/dev/null || true"],
+            capture_output=True,
+            text=True
+        )
+
+        time.sleep(2)
+        return not port_is_busy(port)
+
+    print(f"Tim thay PID: {pids}")
+
+    for pid in pids:
+        info = get_process_info(pid)
+        if info:
+            print(info)
+
+    for pid in pids:
+        if pid == os.getpid():
+            continue
+
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"SIGTERM PID {pid}")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+
+    if wait_port_free(port, timeout=5):
+        print(f"Port {port} da duoc giai phong.")
+        return True
+
+    remaining = get_port_pids(port)
+
+    for pid in remaining:
+        if pid == os.getpid():
+            continue
+
+        try:
+            os.kill(pid, signal.SIGKILL)
+            print(f"SIGKILL PID {pid}")
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+
+    return wait_port_free(port, timeout=5)
+
+print()
+print("=" * 72)
+print("CHECK PORT")
+print("=" * 72)
+
+if not kill_port_processes(PORT):
+    subprocess.run(
+        ["bash", "-lc", f"lsof -i:{PORT} || true"]
+    )
+    raise RuntimeError(f"Port {PORT} van dang bi chiem.")
+
+print()
+print("=" * 72)
+print("CHECK OLD NGROK")
+print("=" * 72)
+
+try:
+    result = subprocess.run(
+        ["pgrep", "-f", "ngrok"],
+        capture_output=True,
+        text=True
     )
 
-print("✅ Launcher build: 2026-08-15-status-v2", flush=True)
+    ngrok_pids = []
 
-required = [
-    PROJECT_DIR / "requirements.txt",
-    PROJECT_DIR / ".env",
-    PROJECT_DIR / "models" / "best_model.pt",
-    PROJECT_DIR / "data" / "dataset" / "dataset.zip",
-    PROJECT_DIR / "training" / "check_paths.py",
+    for line in result.stdout.splitlines():
+        line = line.strip()
+
+        if line.isdigit():
+            pid = int(line)
+            if pid != os.getpid():
+                ngrok_pids.append(pid)
+
+    if ngrok_pids:
+        for pid in ngrok_pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except Exception:
+                pass
+
+        time.sleep(1)
+        print("Da dung ngrok cu.")
+    else:
+        print("Khong co ngrok cu.")
+
+except Exception as e:
+    print(f"Khong kiem tra duoc ngrok: {e}")
+
+possible_launchers = [
+    "launcher.py",
+    "run.py",
+    "app.py",
+    "main.py",
 ]
 
-missing = [p for p in required if not p.exists()]
+existing = [
+    f for f in possible_launchers
+    if (PROJECT_DIR / f).exists()
+]
 
-if missing:
-    print("\n❌ Thiếu file:")
-    for p in missing:
-        print(" -", p)
-    raise RuntimeError("Project chưa đầy đủ.")
+print()
+print("=" * 72)
+print("CHECK PATHS")
+print("=" * 72)
 
-print("✅ Các file bắt buộc đã có.", flush=True)
+if existing:
+    print("Python entry files:", ", ".join(existing))
 
-requirements = PROJECT_DIR / "requirements.txt"
+LAUNCHER_FILE = PROJECT_DIR / "launcher.py"
 
-req_hash = hashlib.sha256(
-    requirements.read_bytes()
-).hexdigest()
+if not LAUNCHER_FILE.exists():
+    fallback_candidates = [
+        PROJECT_DIR / "run.py",
+        PROJECT_DIR / "app.py",
+        PROJECT_DIR / "main.py",
+    ]
 
-marker = Path("/content/.smartwaste_requirements")
+    LAUNCHER_FILE = next(
+        (p for p in fallback_candidates if p.exists()),
+        None
+    )
 
-need_install = True
+if LAUNCHER_FILE is None:
+    raise FileNotFoundError(
+        "Khong tim thay launcher.py, run.py, app.py hoac main.py."
+    )
 
-if marker.exists():
-    if marker.read_text().strip() == req_hash:
-        need_install = False
+print(f"Launcher file: {LAUNCHER_FILE}")
 
-if need_install:
-    print("\n📦 Đang cài dependencies...", flush=True)
+cmd = [
+    sys.executable,
+    "-u",
+    str(LAUNCHER_FILE),
+]
 
-    subprocess.run(
+try:
+    help_result = subprocess.run(
         [
             sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "-q",
-            "-r",
-            "requirements.txt",
+            str(LAUNCHER_FILE),
+            "--help"
         ],
-        cwd=str(PROJECT_DIR),
-        check=True,
+        capture_output=True,
+        text=True,
+        timeout=20
     )
 
-    marker.write_text(req_hash)
+    help_text = help_result.stdout + "\n" + help_result.stderr
+except Exception:
+    help_text = ""
 
-    print("✅ Dependencies OK.", flush=True)
+if "--port" in help_text:
+    cmd += ["--port", str(PORT)]
 
-else:
-    print("✅ Dependencies đã có, bỏ qua pip install.", flush=True)
+if USE_NGROK and "--ngrok" in help_text:
+    cmd += ["--ngrok"]
 
-print("\n" + "=" * 72, flush=True)
-print("CHECK PATHS", flush=True)
-print("=" * 72, flush=True)
+if RELOAD and "--reload" in help_text:
+    cmd += ["--reload"]
 
-result = subprocess.run(
-    [
-        sys.executable,
-        "-u",
-        "training/check_paths.py",
-    ],
-    cwd=str(PROJECT_DIR),
-)
+if "--timeout" in help_text:
+    cmd += ["--timeout", str(STARTUP_TIMEOUT)]
 
-if result.returncode != 0:
-    raise RuntimeError(
-        "❌ Path configuration chưa đúng."
-    )
-
-print("✅ PATHS OK", flush=True)
-
-print("\n" + "=" * 72, flush=True)
-print("START SMART WASTE SCANNER", flush=True)
-print("=" * 72, flush=True)
-
-env = os.environ.copy()
-env["PYTHONUNBUFFERED"] = "1"
+print()
+print("=" * 72)
+print("START SMART WASTE SCANNER")
+print("=" * 72)
+print(f"WASTE SCANNER LAUNCHER | build={LAUNCHER_BUILD}")
+print(f"Python     : {sys.executable}")
+print(f"Project    : {PROJECT_DIR}")
+print("Colab      : True")
+print(f"Port       : {PORT}")
+print(f"Ngrok      : {USE_NGROK}")
+print(f"Reload     : {RELOAD}")
+print("=" * 72)
+print()
+print("Command:")
+print(" ".join(map(str, cmd)))
+print()
 
 process = subprocess.Popen(
-    [
-        sys.executable,
-        "-u",
-        "launcher.py",
-        "--ngrok",
-        "--port",
-        "8000",
-    ],
+    cmd,
     cwd=str(PROJECT_DIR),
-    env=env,
-
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
-
     text=True,
     bufsize=1,
+    universal_newlines=True,
+    env={
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+    }
 )
 
 try:
-    while True:
-
-        line = process.stdout.readline()
+    for line in iter(process.stdout.readline, ""):
+        if not line and process.poll() is not None:
+            break
 
         if line:
             print(line, end="", flush=True)
 
-        if process.poll() is not None:
-            # In nốt output còn lại
-            remaining = process.stdout.read()
-
-            if remaining:
-                print(remaining, end="", flush=True)
-
-            break
-
 except KeyboardInterrupt:
-
-    print(
-        "\n\n⏹ Đang dừng Waste Scanner...",
-        flush=True,
-    )
-
-    process.terminate()
-
     try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-
-    print("✅ Đã dừng.", flush=True)
+        process.terminate()
+        process.wait(timeout=5)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
 
     raise
 
-if process.returncode not in (0, None):
+finally:
+    if process.stdout:
+        process.stdout.close()
+
+return_code = process.poll()
+
+print()
+print("=" * 72)
+
+if return_code == 0:
+    print("Smart Waste Scanner launcher da ket thuc binh thuong.")
+elif return_code is None:
+    print("Smart Waste Scanner dang chay.")
+else:
+    print(f"Launcher ket thuc voi code {return_code}")
+
+print("=" * 72)
+
+if return_code not in (0, None):
     raise RuntimeError(
-        f"Launcher kết thúc với code {process.returncode}"
+        f"Launcher ket thuc voi code {return_code}"
     )
 ```
 
