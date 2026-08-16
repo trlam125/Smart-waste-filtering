@@ -13,6 +13,7 @@ SUPPORTED_ARCHITECTURES: tuple[str, ...] = (
 
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
+TRAIN_AUGMENTATION_PROFILE = "camera_realworld_v2"
 
 
 def create_model(architecture: str, num_classes: int, *, pretrained: bool) -> nn.Module:
@@ -89,19 +90,50 @@ def build_train_transform(
     mean: Sequence[float] = IMAGENET_MEAN,
     std: Sequence[float] = IMAGENET_STD,
 ) -> transforms.Compose:
+    """Camera-like augmentation for real-world single-object waste photos.
+
+    The previous RandomResizedCrop pipeline tended to enlarge the foreground
+    object. Deployment photos often contain a smaller, off-centre object with
+    more surrounding context, so this profile keeps a normal resize/crop and
+    then randomly translates and scales the whole view.
+    """
+    resize_size = max(image_size, int(round(image_size * 256 / 224)))
+    fill = tuple(int(round(float(value) * 255.0)) for value in mean)
     return transforms.Compose(
         [
-            transforms.RandomResizedCrop(
-                image_size,
-                scale=(0.72, 1.0),
-                ratio=(0.80, 1.25),
+            transforms.Resize(
+                resize_size,
                 interpolation=transforms.InterpolationMode.BICUBIC,
             ),
+            transforms.RandomCrop(image_size),
+            transforms.RandomAffine(
+                degrees=12,
+                translate=(0.12, 0.12),
+                scale=(0.72, 1.08),
+                shear=(-5.0, 5.0),
+                interpolation=transforms.InterpolationMode.BILINEAR,
+                fill=fill,
+            ),
             transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=12),
-            transforms.ColorJitter(brightness=0.20, contrast=0.20, saturation=0.18, hue=0.03),
+            transforms.RandomApply(
+                [
+                    transforms.ColorJitter(
+                        brightness=0.25,
+                        contrast=0.25,
+                        saturation=0.20,
+                        hue=0.03,
+                    )
+                ],
+                p=0.80,
+            ),
+            transforms.RandomPerspective(
+                distortion_scale=0.15,
+                p=0.15,
+                interpolation=transforms.InterpolationMode.BILINEAR,
+                fill=fill,
+            ),
             transforms.ToTensor(),
             transforms.Normalize(mean=tuple(mean), std=tuple(std)),
-            transforms.RandomErasing(p=0.12, scale=(0.02, 0.10), ratio=(0.5, 2.0)),
+            transforms.RandomErasing(p=0.10, scale=(0.02, 0.08), ratio=(0.5, 2.0)),
         ]
     )

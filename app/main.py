@@ -6,6 +6,7 @@ import hmac
 import io
 import logging
 import os
+import shutil
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -307,27 +308,52 @@ def _commit_collected_sample(
     predicted_key: str,
     is_correct: bool,
 ) -> dict[str, Any]:
-    """Promote a staged image into the confirmed real-world dataset."""
+    """Promote a staged image into the confirmed real-world dataset.
+
+    Colab commonly stages pending images under /content while the durable
+    collection lives on the Google Drive mount under /content/drive. A direct
+    Path.replace()/os.replace() cannot move a file across those filesystems and
+    raises EXDEV ("Invalid cross-device link"). Copy into a temporary file in
+    the destination directory first, atomically replace the final file there,
+    then remove the source only after the destination has been committed.
+    """
     if not DATASET_COLLECTION_ENABLED:
-        return {"enabled": False, "saved": False, "image_path": None}
+        return {
+            "enabled": False,
+            "saved": False,
+            "image_path": None,
+            "reason": "disabled",
+        }
     if corrected_key not in RULE_BY_KEY:
-        return {"enabled": True, "saved": False, "image_path": None}
+        return {
+            "enabled": True,
+            "saved": False,
+            "image_path": None,
+            "reason": "invalid_label",
+        }
 
     filename = f"scan_{scan_id}.jpg"
     pending = COLLECTED_PENDING_DIR / filename
     target_dir = COLLECTED_DATA_DIR / corrected_key
     target = target_dir / filename
+    temporary = target_dir / f".scan_{scan_id}_{os.getpid()}.tmp"
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
         existing = _collection_sample_candidates(scan_id)
         source: Path | None = pending if pending.is_file() else (existing[0] if existing else None)
         if source is None:
-            return {"enabled": True, "saved": False, "image_path": None}
+            return {
+                "enabled": True,
+                "saved": False,
+                "image_path": None,
+                "reason": "source_missing",
+            }
 
         if source != target:
-            if target.exists():
-                target.unlink()
-            source.replace(target)
+            temporary.unlink(missing_ok=True)
+            shutil.copy2(source, temporary)
+            temporary.replace(target)
+            source.unlink(missing_ok=True)
 
         # Remove any stale copy left in a class directory after a label edit.
         for stale in _collection_sample_candidates(scan_id):
@@ -345,10 +371,17 @@ def _commit_collected_sample(
             "enabled": True,
             "saved": True,
             "image_path": target.relative_to(COLLECTED_DATA_DIR).as_posix(),
+            "reason": None,
         }
     except OSError:
         logger.exception("Could not promote collected dataset image for scan_id=%s", scan_id)
-        return {"enabled": True, "saved": False, "image_path": None}
+        temporary.unlink(missing_ok=True)
+        return {
+            "enabled": True,
+            "saved": False,
+            "image_path": None,
+            "reason": "storage_error",
+        }
 
 
 def _delete_pending_collection_image(scan_id: int) -> int:
@@ -871,6 +904,7 @@ async def submit_feedback(
         "enabled": DATASET_COLLECTION_ENABLED,
         "saved": False,
         "image_path": None,
+        "reason": "not_attempted",
     }
     async with history_mutation_gate:
         saved = await run_in_threadpool(
@@ -923,7 +957,17 @@ async def submit_feedback(
     if collection_result.get("saved"):
         message += " Ảnh đã được lưu vào bộ dữ liệu thực tế để dùng cho lần fine-tune sau."
     elif DATASET_COLLECTION_ENABLED:
-        message += " Không tìm thấy ảnh nguồn để thêm vào bộ dữ liệu thực tế (có thể đây là lịch sử tạo trước bản cập nhật này)."
+        collection_reason = collection_result.get("reason")
+        if collection_reason == "storage_error":
+            message += (
+                " Phản hồi đã được lưu, nhưng ảnh chưa thể ghi vào bộ dữ liệu thực tế "
+                "do lỗi lưu trữ. Vui lòng thử lại sau."
+            )
+        elif collection_reason == "source_missing":
+            message += (
+                " Không tìm thấy ảnh nguồn để thêm vào bộ dữ liệu thực tế "
+                "(có thể đây là lịch sử tạo trước bản cập nhật này)."
+            )
 
     return {
         **saved,

@@ -31,6 +31,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from PIL import Image
 from torchvision.datasets import ImageFolder
 
 from app.class_schema import WASTE_CLASS_KEYS  # noqa: E402
@@ -40,6 +41,7 @@ from app.model_factory import (  # noqa: E402
     IMAGENET_MEAN,
     IMAGENET_STD,
     SUPPORTED_ARCHITECTURES,
+    TRAIN_AUGMENTATION_PROFILE,
     build_eval_transform,
     build_train_transform,
     create_model,
@@ -87,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         default="efficientnet_b0",
     )
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -146,6 +148,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Resume from a last_checkpoint.pt created by this script.",
+    )
+    parser.add_argument(
+        "--challenge-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional evaluation-only directory whose immediate subdirectories are canonical "
+            "class names. If omitted, <dataset_root>/challenge_realworld is used when present. "
+            "Challenge images never affect checkpoint selection or temperature calibration."
+        ),
     )
     args = parser.parse_args()
     if args.output is None:
@@ -506,6 +518,153 @@ def deployment_metrics_from_logits(
     return metrics
 
 
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def resolve_challenge_dir(data_root: Path, requested: Path | None) -> Path | None:
+    if requested is not None:
+        candidate = requested.expanduser()
+        if not candidate.is_absolute():
+            candidate = resolve_project_path(candidate)
+        if not candidate.is_dir():
+            raise FileNotFoundError(f"Challenge directory not found: {candidate}")
+        return candidate
+
+    candidate = data_root / "challenge_realworld"
+    return candidate if candidate.is_dir() else None
+
+
+def discover_challenge_samples(challenge_dir: Path) -> list[tuple[Path, int, str]]:
+    samples: list[tuple[Path, int, str]] = []
+    expected = set(WASTE_CLASS_KEYS)
+    extra_dirs = sorted(
+        p.name
+        for p in challenge_dir.iterdir()
+        if p.is_dir() and not p.name.startswith(".") and p.name not in expected
+    )
+    if extra_dirs:
+        raise RuntimeError(
+            f"Challenge directory {challenge_dir} contains non-canonical class folders: {extra_dirs}"
+        )
+
+    class_to_idx = {name: i for i, name in enumerate(WASTE_CLASS_KEYS)}
+    for class_name in WASTE_CLASS_KEYS:
+        class_dir = challenge_dir / class_name
+        if not class_dir.is_dir():
+            continue
+        for path in sorted(class_dir.rglob("*")):
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS:
+                samples.append((path, class_to_idx[class_name], class_name))
+    return samples
+
+
+@torch.inference_mode()
+def evaluate_challenge_realworld(
+    model: nn.Module,
+    *,
+    data_root: Path,
+    requested_dir: Path | None,
+    device: torch.device,
+    image_size: int,
+    temperature: float,
+) -> dict[str, Any] | None:
+    """Evaluate optional real-world holdout images without using them for tuning."""
+    challenge_dir = resolve_challenge_dir(data_root, requested_dir)
+    if challenge_dir is None:
+        return None
+
+    samples = discover_challenge_samples(challenge_dir)
+    if not samples:
+        print(f"Challenge directory is present but has no supported images: {challenge_dir}")
+        return {
+            "challenge_dir": str(challenge_dir),
+            "samples": 0,
+            "accuracy": None,
+            "correct": 0,
+            "predictions": [],
+        }
+
+    transform = build_eval_transform(image_size)
+    model.eval()
+    records: list[dict[str, Any]] = []
+    correct = 0
+    for path, target_idx, target_name in samples:
+        with Image.open(path) as image:
+            tensor = transform(image.convert("RGB")).unsqueeze(0).to(device)
+        logits = model(tensor)[0].detach().to("cpu", dtype=torch.float32)
+        probabilities = torch.softmax(logits / float(temperature), dim=0)
+        top_values, top_indices = torch.topk(probabilities, k=min(3, len(WASTE_CLASS_KEYS)))
+        predicted_idx = int(top_indices[0])
+        predicted_name = WASTE_CLASS_KEYS[predicted_idx]
+        is_correct = predicted_idx == target_idx
+        correct += int(is_correct)
+        try:
+            display_path = str(path.relative_to(data_root))
+        except ValueError:
+            display_path = str(path)
+        records.append(
+            {
+                "path": display_path,
+                "expected": target_name,
+                "predicted": predicted_name,
+                "confidence": float(top_values[0]),
+                "correct": bool(is_correct),
+                "top3": [
+                    {
+                        "class": WASTE_CLASS_KEYS[int(index)],
+                        "probability": float(value),
+                    }
+                    for value, index in zip(top_values.tolist(), top_indices.tolist())
+                ],
+            }
+        )
+
+    accuracy = correct / len(records)
+    return {
+        "challenge_dir": str(challenge_dir),
+        "samples": len(records),
+        "correct": correct,
+        "accuracy": float(accuracy),
+        "temperature": float(temperature),
+        "note": "Evaluation only; never used for training, checkpoint selection, or calibration.",
+        "predictions": records,
+    }
+
+
+def save_challenge_csv(path: Path, payload: dict[str, Any]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(
+            [
+                "path",
+                "expected",
+                "predicted",
+                "confidence",
+                "correct",
+                "top1",
+                "top2",
+                "top3",
+            ]
+        )
+        for record in payload.get("predictions", []):
+            top3 = list(record.get("top3", []))
+            formatted = [
+                f"{item['class']}:{float(item['probability']):.6f}"
+                for item in top3[:3]
+            ]
+            formatted.extend([""] * (3 - len(formatted)))
+            writer.writerow(
+                [
+                    record.get("path", ""),
+                    record.get("expected", ""),
+                    record.get("predicted", ""),
+                    f"{float(record.get('confidence', 0.0)):.6f}",
+                    bool(record.get("correct", False)),
+                    *formatted,
+                ]
+            )
+
+
 def cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
@@ -602,6 +761,7 @@ def main() -> int:
     print(f"Dataset: {data_root}")
     print(f"Device: {device}")
     print(f"Architecture: {args.arch} | image_size={args.image_size}")
+    print(f"Train augmentation: {TRAIN_AUGMENTATION_PROFILE}")
     print(f"Samples: train={len(train_ds)} val={len(val_ds)} test={len(test_ds)}")
     for key, count in zip(WASTE_CLASS_KEYS, counts):
         print(f"  {key:14s} train={count}")
@@ -706,6 +866,7 @@ def main() -> int:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "arch": args.arch,
                 "image_size": args.image_size,
+                "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
                 "class_names": list(WASTE_CLASS_KEYS),
                 "mean": list(IMAGENET_MEAN),
                 "std": list(IMAGENET_STD),
@@ -729,6 +890,7 @@ def main() -> int:
             "format_version": 4,
             "arch": args.arch,
             "image_size": args.image_size,
+            "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
             "class_names": list(WASTE_CLASS_KEYS),
             "epoch": epoch,
             "best_val_macro_f1": best_val_macro_f1,
@@ -769,6 +931,7 @@ def main() -> int:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "arch": args.arch,
             "image_size": args.image_size,
+            "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
             "class_names": list(WASTE_CLASS_KEYS),
             "mean": list(IMAGENET_MEAN),
             "std": list(IMAGENET_STD),
@@ -809,10 +972,35 @@ def main() -> int:
     save_json(output_dir / "test_metrics.json", test_metrics)
     save_confusion_csv(output_dir / "test_confusion_matrix.csv", test_metrics["confusion_matrix"])
 
+    challenge_metrics = evaluate_challenge_realworld(
+        model,
+        data_root=data_root,
+        requested_dir=args.challenge_dir,
+        device=device,
+        image_size=args.image_size,
+        temperature=float(calibration["temperature"]),
+    )
+    if challenge_metrics is not None:
+        save_json(output_dir / "challenge_realworld_metrics.json", challenge_metrics)
+        save_challenge_csv(output_dir / "challenge_realworld_predictions.csv", challenge_metrics)
+        if challenge_metrics.get("samples", 0):
+            print("\n=== REAL-WORLD CHALLENGE (evaluation only) ===")
+            for record in challenge_metrics["predictions"]:
+                marker = "OK" if record["correct"] else "MISS"
+                print(
+                    f"[{marker}] {record['path']} | expected={record['expected']} "
+                    f"predicted={record['predicted']} confidence={record['confidence']:.4f}"
+                )
+            print(
+                f"Challenge: {challenge_metrics['correct']}/{challenge_metrics['samples']} "
+                f"accuracy={challenge_metrics['accuracy']:.4f}"
+            )
+
     summary = {
         "dataset_root": str(data_root),
         "architecture": args.arch,
         "image_size": args.image_size,
+        "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
         "class_names": list(WASTE_CLASS_KEYS),
         "train_samples": len(train_ds),
         "val_samples": len(val_ds),
@@ -822,6 +1010,7 @@ def main() -> int:
         "best_val_macro_f1": best_val_macro_f1,
         "temperature_calibration": calibration,
         "test_metrics": test_metrics,
+        "challenge_realworld": challenge_metrics,
     }
     save_json(output_dir / "training_summary.json", summary)
 

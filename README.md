@@ -17,12 +17,12 @@ Smart waste scanner/
 └── ...
 ```
 
-`dataset.zip` can contain `train/`, `val/`, and `test/` directly, or it can have a root directory wrapping them, such as `SmartWaste_Household_EWaste_11class_native_v2`.
+`dataset.zip` can contain `train/`, `val/`, and `test/` directly, or it can have a root directory wrapping them, such as `SmartWaste_Household_Kaan_11class_maxclean_v2`.
 
 On the first run, the code automatically extracts the dataset. The cache location depends on the environment:
 
 ```text
-Local : data/.runtime/dataset_extracted/
+Local : data/dataset/_extracted/
 Colab : /content/smart_waste_scanner_runtime/dataset_extracted/
 ```
 
@@ -90,7 +90,7 @@ python training\inspect_dataset.py
 Default training command:
 
 ```bat
-python training\train.py --arch efficientnet_b0 --epochs 30 --batch-size 32 --device auto
+python training\train.py --arch efficientnet_b0 --image-size 224 --epochs 40 --batch-size 16 --lr 3e-4 --weight-decay 1e-4 --label-smoothing 0.08 --class-weighting sqrt --patience 8 --device auto --workers 0 --amp
 ```
 
 There is no need to pass `--data`; the default is `data\dataset\dataset.zip`.
@@ -107,7 +107,18 @@ Resume:
 
 ```bat
 python training\train.py ^
+  --arch efficientnet_b0 ^
+  --image-size 224 ^
   --epochs 40 ^
+  --batch-size 16 ^
+  --lr 3e-4 ^
+  --weight-decay 1e-4 ^
+  --label-smoothing 0.08 ^
+  --class-weighting sqrt ^
+  --patience 8 ^
+  --device auto ^
+  --workers 0 ^
+  --amp ^
   --resume runs\efficientnet_b0\last_checkpoint.pt
 ```
 
@@ -149,16 +160,7 @@ docker compose --env-file .env up --build waste-scanner
 
 Docker Compose mounts `./models` into the container. Train the model first and place `best_model.pt` in `models/`.
 
-## 9. ngrok (optional)
-
-```bat
-start.bat configure
-start.bat ngrok
-```
-
-`pyngrok` is included in the shared `requirements.txt`, so installing the project requirements once is enough. When `launcher.py --ngrok` is used, the launcher waits for the AI readiness endpoint before creating the public tunnel.
-
-## 10. Collecting real-world data
+## 9. Collecting real-world data
 
 Each time a scan is saved to history, the app temporarily keeps a high-quality JPEG image. The image **only becomes training data** after the user confirms or corrects the label. At that point, the image is moved into:
 
@@ -185,8 +187,9 @@ DATASET_COLLECTION_ENABLED=true
 COLLECTED_DATA_DIR=
 COLLECTED_IMAGE_MAX_DIMENSION=1600
 COLLECTED_JPEG_QUALITY=92
+```
 
-## 11. Run on Google Colab
+## 10. Run on Google Colab
 
 Place the entire project folder in Google Drive, for example:
 
@@ -298,9 +301,14 @@ Example with EfficientNet-B0:
 ```python
 !python training/train.py \
     --arch efficientnet_b0 \
-    --epochs 30 \
+    --image-size 224 \
+    --epochs 40 \
     --batch-size 32 \
     --lr 3e-4 \
+    --weight-decay 1e-4 \
+    --label-smoothing 0.08 \
+    --class-weighting sqrt \
+    --patience 8 \
     --device cuda \
     --workers 2 \
     --amp
@@ -318,15 +326,21 @@ The best deployment model is copied to:
 
 ```text
 models/best_model.pt
+```
 
 If Colab is interrupted during training, you can resume, for example:
 
 ```python
 !python training/train.py \
     --arch efficientnet_b0 \
-    --epochs 30 \
+    --image-size 224 \
+    --epochs 40 \
     --batch-size 32 \
     --lr 3e-4 \
+    --weight-decay 1e-4 \
+    --label-smoothing 0.08 \
+    --class-weighting sqrt \
+    --patience 8 \
     --device cuda \
     --workers 2 \
     --amp \
@@ -375,7 +389,7 @@ Then:
 ```
 
 Or run in 1 cell:
-```
+```python
 import os
 import sys
 import subprocess

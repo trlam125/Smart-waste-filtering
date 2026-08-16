@@ -5,6 +5,9 @@ cd /d "%~dp0"
 set "DATASET=%~1"
 if not defined DATASET set "DATASET=%CD%\data\dataset\dataset.zip"
 
+set "OUTPUT=%CD%\runs\efficientnet_b0"
+set "CHECKPOINT=%OUTPUT%\last_checkpoint.pt"
+
 if not exist "%DATASET%" (
   echo.
   echo [ERROR] Dataset not found:
@@ -34,11 +37,41 @@ python training\inspect_dataset.py --data "%DATASET%"
 if errorlevel 1 exit /b 1
 
 echo.
-echo === Training EfficientNet-B0 ===
-python training\train.py --data "%DATASET%" --arch efficientnet_b0 --epochs 30 --batch-size 16 --lr 3e-4 --device auto --workers 0 --amp
-if errorlevel 1 exit /b 1
+if exist "%CHECKPOINT%" (
+  echo === Resume checkpoint found ===
+  echo   %CHECKPOINT%
+  echo Training will continue from the last completed epoch.
+  echo.
+  echo === Training EfficientNet-B0 - RESUME ===
+  python training\train.py --data "%DATASET%" --arch efficientnet_b0 --image-size 224 --epochs 40 --batch-size 16 --lr 3e-4 --weight-decay 1e-4 --label-smoothing 0.08 --class-weighting sqrt --patience 8 --device auto --workers 0 --amp --output "%OUTPUT%" --resume "%CHECKPOINT%"
+) else (
+  echo === No resume checkpoint found ===
+  echo Training will start from epoch 1.
+  echo.
+  echo === Training EfficientNet-B0 - NEW ===
+  python training\train.py --data "%DATASET%" --arch efficientnet_b0 --image-size 224 --epochs 40 --batch-size 16 --lr 3e-4 --weight-decay 1e-4 --label-smoothing 0.08 --class-weighting sqrt --patience 8 --device auto --workers 0 --amp --output "%OUTPUT%"
+)
+
+if errorlevel 1 (
+  echo.
+  echo Training stopped or failed.
+  if exist "%CHECKPOINT%" (
+    echo Resume checkpoint kept at:
+    echo   %CHECKPOINT%
+    echo Run train_model.bat again to continue.
+  ) else (
+    echo No completed-epoch checkpoint is available yet.
+  )
+  exit /b 1
+)
 
 echo.
-echo Training finished.
+echo Training finished successfully.
+
+if exist "%CHECKPOINT%" (
+  del /q "%CHECKPOINT%"
+  echo Resume checkpoint removed because training completed successfully.
+)
+
 echo Best model: %CD%\models\best_model.pt
 endlocal

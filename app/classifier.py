@@ -118,6 +118,14 @@ class WasteClassifier:
             "UNCERTAINTY_MARGIN", 0.10, minimum=0.0, maximum=1.0
         )
         self.retry_seconds = _finite_float_env("MODEL_RETRY_SECONDS", 10.0, minimum=0.0)
+        self.auto_reload = _bool_env("MODEL_AUTO_RELOAD", True)
+        self.reload_check_seconds = _finite_float_env(
+            "MODEL_RELOAD_CHECK_SECONDS", 2.0, minimum=0.0
+        )
+        self.framing_rescue_enabled = _bool_env("FRAMING_RESCUE_ENABLED", True)
+        self.framing_rescue_min_confidence = _finite_float_env(
+            "FRAMING_RESCUE_MIN_CONFIDENCE", 0.75, minimum=0.0, maximum=1.0
+        )
         self.ood_enabled = _bool_env("OOD_DETECTION_ENABLED", True)
         self.ood_auto_build = _bool_env("OOD_AUTO_BUILD", True)
         self.ood_reference_path = ood_reference_path()
@@ -135,12 +143,56 @@ class WasteClassifier:
         self._lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self._known_checkpoint_hash: str | None = None
+        self._loaded_checkpoint_signature: tuple[int, int] | None = None
+        self._last_checkpoint_check = 0.0
         self._runtime_device_override: str | None = None
 
     def _retry_allowed(self) -> bool:
         if self._load_error is None or self._load_error_at is None:
             return True
         return (time.monotonic() - self._load_error_at) >= self.retry_seconds
+
+    def _checkpoint_signature(self) -> tuple[int, int]:
+        stat = self.checkpoint_path.stat()
+        return int(stat.st_mtime_ns), int(stat.st_size)
+
+    def _invalidate_if_checkpoint_changed(self) -> None:
+        """Drop the cached runtime when best_model.pt is replaced after training."""
+        if not self.auto_reload or self._loaded is None:
+            return
+
+        now = time.monotonic()
+        if (
+            self.reload_check_seconds > 0.0
+            and (now - self._last_checkpoint_check) < self.reload_check_seconds
+        ):
+            return
+        self._last_checkpoint_check = now
+
+        try:
+            current_signature = self._checkpoint_signature()
+        except OSError:
+            # Keep serving the already-loaded model if the file is only temporarily
+            # unavailable while a trainer is replacing it. A later request retries.
+            return
+
+        if current_signature == self._loaded_checkpoint_signature:
+            return
+
+        with self._lock:
+            if self._loaded is None:
+                return
+            if current_signature == self._loaded_checkpoint_signature:
+                return
+            logger.info(
+                "Checkpoint changed on disk; invalidating cached model for hot reload: %s",
+                self.checkpoint_path,
+            )
+            self._loaded = None
+            self._known_checkpoint_hash = None
+            self._loaded_checkpoint_signature = None
+            self._load_error = None
+            self._load_error_at = None
 
     @staticmethod
     def _resolve_device(torch_module: Any, preference: str) -> Any:
@@ -220,6 +272,7 @@ class WasteClassifier:
         return payload
 
     def _load(self) -> _LoadedModel:
+        self._invalidate_if_checkpoint_changed()
         if self._loaded is not None:
             return self._loaded
         if self._load_error is not None and not self._retry_allowed():
@@ -243,6 +296,7 @@ class WasteClassifier:
 
                 import torch
 
+                signature_before = self._checkpoint_signature()
                 checkpoint = self._safe_torch_load(torch, self.checkpoint_path)
                 architecture = str(checkpoint.get("arch", "")).strip().lower()
                 image_size = int(checkpoint.get("image_size", 224))
@@ -260,6 +314,11 @@ class WasteClassifier:
                     raise ValueError("Checkpoint thiếu model_state_dict")
 
                 checkpoint_hash = _file_sha256(self.checkpoint_path)
+                signature_after = self._checkpoint_signature()
+                if signature_after != signature_before:
+                    raise RuntimeError(
+                        "Checkpoint changed while it was being loaded; retry the request."
+                    )
                 self._ensure_ood_reference(checkpoint_hash)
 
                 effective_device_preference = self._runtime_device_override or self.device_preference
@@ -332,6 +391,7 @@ class WasteClassifier:
                     ood_reference_path = str(self.ood_reference_path)
 
                 self._known_checkpoint_hash = checkpoint_hash
+                self._loaded_checkpoint_signature = signature_after
                 self._loaded = _LoadedModel(
                     model=model,
                     transform=transform,
@@ -413,6 +473,10 @@ class WasteClassifier:
             "class_names": list(WASTE_CLASS_KEYS),
             "error": self._load_error,
             "retry_in_seconds": round(retry_in_seconds, 1),
+            "model_auto_reload": self.auto_reload,
+            "model_reload_check_seconds": self.reload_check_seconds,
+            "framing_rescue_enabled": self.framing_rescue_enabled,
+            "framing_rescue_min_confidence": self.framing_rescue_min_confidence,
             "unknown_threshold": self.unknown_threshold,
             "uncertainty_margin": self.uncertainty_margin,
             "ood_detection_enabled": self.ood_enabled,
@@ -454,6 +518,90 @@ class WasteClassifier:
         embedding = tuple(float(value) for value in feature_vector.tolist())
         return scores, embedding
 
+    @staticmethod
+    def _center_crop_fraction(image: Image.Image, fraction: float) -> Image.Image:
+        width, height = image.size
+        crop_width = max(2, min(width, int(round(width * fraction))))
+        crop_height = max(2, min(height, int(round(height * fraction))))
+        left = (width - crop_width) // 2
+        top = (height - crop_height) // 2
+        return image.crop((left, top, left + crop_width, top + crop_height))
+
+    def _apply_framing_rescue(
+        self,
+        loaded: _LoadedModel,
+        image: Image.Image,
+        scores: list[float],
+        embedding: tuple[float, ...],
+    ) -> tuple[list[float], tuple[float, ...], dict[str, Any]]:
+        """Rescue small electronic accessories that a background dominates.
+
+        The current classifier is trained on single-object crops. In a phone camera
+        photo, a small white charger on a large table can be classified as paper or
+        cardboard because the background occupies most of the frame. We only run
+        this extra path for that narrow failure mode, and require two independent
+        center zooms to agree on ``electronic`` before overriding the full-frame
+        prediction. This avoids applying aggressive multi-crop voting to every class.
+        """
+        base_index = int(np.argmax(np.asarray(scores, dtype=np.float32)))
+        base_key = loaded.class_names[base_index]
+        info: dict[str, Any] = {
+            "enabled": self.framing_rescue_enabled,
+            "applied": False,
+            "base_key": base_key,
+            "base_confidence": round(float(scores[base_index]), 4),
+            "reason": "not_needed",
+            "views": [],
+        }
+
+        if not self.framing_rescue_enabled:
+            info["reason"] = "disabled"
+            return scores, embedding, info
+        if base_key not in {"paper", "cardboard"}:
+            return scores, embedding, info
+        if "electronic" not in loaded.class_names:
+            return scores, embedding, info
+
+        electronic_index = loaded.class_names.index("electronic")
+        candidate_results: list[tuple[float, list[float], tuple[float, ...]]] = []
+        for fraction in (0.70, 0.55):
+            crop = self._center_crop_fraction(image, fraction)
+            crop_scores, crop_embedding = self._run_inference(loaded, crop)
+            crop_top_index = int(np.argmax(np.asarray(crop_scores, dtype=np.float32)))
+            crop_top_key = loaded.class_names[crop_top_index]
+            electronic_score = float(crop_scores[electronic_index])
+            info["views"].append(
+                {
+                    "center_fraction": fraction,
+                    "top1_key": crop_top_key,
+                    "top1_confidence": round(float(crop_scores[crop_top_index]), 4),
+                    "electronic_confidence": round(electronic_score, 4),
+                }
+            )
+            candidate_results.append((electronic_score, crop_scores, crop_embedding))
+
+        both_electronic = all(
+            view["top1_key"] == "electronic" for view in info["views"]
+        )
+        mean_electronic_confidence = float(
+            sum(result[0] for result in candidate_results) / len(candidate_results)
+        )
+        info["mean_electronic_confidence"] = round(mean_electronic_confidence, 4)
+
+        if (
+            both_electronic
+            and mean_electronic_confidence >= self.framing_rescue_min_confidence
+        ):
+            best_candidate = max(candidate_results, key=lambda item: item[0])
+            info["applied"] = True
+            info["reason"] = "two_zoom_views_agree_on_electronic"
+            info["selected_key"] = "electronic"
+            info["selected_confidence"] = round(best_candidate[0], 4)
+            return best_candidate[1], best_candidate[2], info
+
+        info["reason"] = "zoom_views_not_strong_enough"
+        return scores, embedding, info
+
     def _handle_inference_failure(self, loaded: _LoadedModel, exc: Exception) -> bool:
         """Invalidate a broken runtime and tell the caller whether to retry once on CPU."""
         message = f"Model inference failed on {loaded.device}: {exc}"
@@ -479,8 +627,12 @@ class WasteClassifier:
         loaded = self._load()
         image = image.convert("RGB")
 
+        framing_rescue: dict[str, Any] = {}
         try:
             scores, embedding = self._run_inference(loaded, image)
+            scores, embedding, framing_rescue = self._apply_framing_rescue(
+                loaded, image, scores, embedding
+            )
         except Exception as exc:
             logger.exception("Trained-model inference failed")
             if self._handle_inference_failure(loaded, exc):
@@ -493,6 +645,9 @@ class WasteClassifier:
                     raise ModelUnavailableError(f"Model inference failed: {retry_exc}") from retry_exc
                 try:
                     scores, embedding = self._run_inference(fallback_loaded, image)
+                    scores, embedding, framing_rescue = self._apply_framing_rescue(
+                        fallback_loaded, image, scores, embedding
+                    )
                     loaded = fallback_loaded
                 except Exception as retry_exc:
                     logger.exception("CPU fallback inference failed")
@@ -570,6 +725,7 @@ class WasteClassifier:
             },
             "checkpoint_id": loaded.checkpoint_hash[:12],
             "feature_dimension": len(embedding),
+            "framing_rescue": framing_rescue,
         }
         return ClassificationResult(
             key=best_key,
