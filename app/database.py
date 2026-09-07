@@ -39,9 +39,9 @@ def _nonnegative_int_env(name: str, default: int) -> int:
     try:
         value = int(raw_value)
     except ValueError as exc:
-        raise RuntimeError(f"{name} phải là số nguyên >= 0, nhận được: {raw_value!r}") from exc
+        raise RuntimeError(f"{name} must be an integer >= 0; received: {raw_value!r}") from exc
     if value < 0:
-        raise RuntimeError(f"{name} phải >= 0, nhận được: {value}")
+        raise RuntimeError(f"{name} must be >= 0; received: {value}")
     return value
 
 
@@ -49,7 +49,7 @@ SQLITE_BUSY_TIMEOUT_MS = _nonnegative_int_env("SQLITE_BUSY_TIMEOUT_MS", 5000)
 SQLITE_JOURNAL_MODE = os.getenv("SQLITE_JOURNAL_MODE", "DELETE").strip().upper()
 if SQLITE_JOURNAL_MODE not in {"DELETE", "WAL"}:
     raise RuntimeError(
-        "SQLITE_JOURNAL_MODE chỉ hỗ trợ DELETE hoặc WAL, nhận được: "
+        "SQLITE_JOURNAL_MODE only supports DELETE or WAL; received: "
         f"{SQLITE_JOURNAL_MODE!r}"
     )
 
@@ -57,7 +57,7 @@ if SQLITE_JOURNAL_MODE not in {"DELETE", "WAL"}:
 def _normalize_search_text(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value.casefold())
     without_marks = "".join(char for char in decomposed if not unicodedata.combining(char))
-    return " ".join(without_marks.replace("đ", "d").split())
+    return " ".join(without_marks.replace("\u0111", "d").split())
 
 
 def _connect() -> sqlite3.Connection:
@@ -317,6 +317,71 @@ def add_scan_if_history_generation(
         )
         connection.commit()
         return int(cursor.lastrowid)
+
+
+def add_scans_if_history_generation(
+    scans: list[dict[str, Any]],
+    client_id: str,
+    expected_generation: int,
+) -> list[int] | None:
+    """Atomically store every detected object from one camera scan.
+
+    Each object remains an independent history/feedback row with its own scan_id,
+    but all rows are committed together so a concurrent history clear can never
+    leave only a subset of the objects persisted.
+    """
+    if not scans:
+        return []
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    inserted_ids: list[int] = []
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT value FROM history_state WHERE key = 'generation'"
+        ).fetchone()
+        try:
+            current_generation = max(0, int(str(row["value"]))) if row is not None else 0
+        except (TypeError, ValueError):
+            current_generation = 0
+        if current_generation != max(0, int(expected_generation)):
+            connection.rollback()
+            return None
+
+        for item in scans:
+            waste_key = str(item["waste_key"])
+            display_name = str(item["display_name"])
+            category = str(item["category"])
+            cursor = connection.execute(
+                """
+                INSERT INTO scans (
+                    waste_key, display_name, display_name_search, category, category_search,
+                    confidence, uncertain, model_waste_key, model_confidence, model_uncertain,
+                    effective_score, memory_applied, client_id, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    waste_key,
+                    display_name,
+                    _normalize_search_text(display_name),
+                    category,
+                    _normalize_search_text(category),
+                    float(item["confidence"]),
+                    int(bool(item["uncertain"])),
+                    str(item["model_waste_key"]),
+                    float(item["model_confidence"]),
+                    int(bool(item["model_uncertain"])),
+                    float(item["effective_score"]),
+                    int(bool(item["memory_applied"])),
+                    client_id,
+                    created_at,
+                ),
+            )
+            inserted_ids.append(int(cursor.lastrowid))
+
+        connection.commit()
+    return inserted_ids
 
 
 def set_scan_thumbnail_name(scan_id: int, client_id: str, thumbnail_name: str) -> bool:

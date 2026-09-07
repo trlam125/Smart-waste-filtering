@@ -118,16 +118,26 @@ class WasteClassifier:
             "UNCERTAINTY_MARGIN", 0.10, minimum=0.0, maximum=1.0
         )
         self.retry_seconds = _finite_float_env("MODEL_RETRY_SECONDS", 10.0, minimum=0.0)
+        self.device_recovery_seconds = _finite_float_env(
+            "MODEL_DEVICE_RECOVERY_SECONDS", 60.0, minimum=0.0
+        )
         self.auto_reload = _bool_env("MODEL_AUTO_RELOAD", True)
         self.reload_check_seconds = _finite_float_env(
             "MODEL_RELOAD_CHECK_SECONDS", 2.0, minimum=0.0
         )
-        self.framing_rescue_enabled = _bool_env("FRAMING_RESCUE_ENABLED", True)
+        self.framing_rescue_enabled = _bool_env("FRAMING_RESCUE_ENABLED", False)
         self.framing_rescue_min_confidence = _finite_float_env(
             "FRAMING_RESCUE_MIN_CONFIDENCE", 0.75, minimum=0.0, maximum=1.0
         )
         self.ood_enabled = _bool_env("OOD_DETECTION_ENABLED", True)
         self.ood_auto_build = _bool_env("OOD_AUTO_BUILD", True)
+        self.ood_class_mismatch_enabled = _bool_env("OOD_CLASS_MISMATCH_ENABLED", True)
+        self.ood_class_mismatch_min_similarity = _finite_float_env(
+            "OOD_CLASS_MISMATCH_MIN_SIMILARITY", 0.60, minimum=-1.0, maximum=1.0
+        )
+        self.ood_class_mismatch_min_gap = _finite_float_env(
+            "OOD_CLASS_MISMATCH_MIN_GAP", 0.08, minimum=0.0, maximum=2.0
+        )
         self.ood_reference_path = ood_reference_path()
         raw_ood_threshold = os.getenv("OOD_MIN_SIMILARITY", "").strip()
         self.ood_threshold_override = (
@@ -146,6 +156,7 @@ class WasteClassifier:
         self._loaded_checkpoint_signature: tuple[int, int] | None = None
         self._last_checkpoint_check = 0.0
         self._runtime_device_override: str | None = None
+        self._runtime_device_override_at: float | None = None
 
     def _retry_allowed(self) -> bool:
         if self._load_error is None or self._load_error_at is None:
@@ -155,6 +166,42 @@ class WasteClassifier:
     def _checkpoint_signature(self) -> tuple[int, int]:
         stat = self.checkpoint_path.stat()
         return int(stat.st_mtime_ns), int(stat.st_size)
+
+    def _device_recovery_retry_in_seconds(self) -> float:
+        if (
+            self.device_preference != "auto"
+            or self._runtime_device_override is None
+            or self._runtime_device_override_at is None
+        ):
+            return 0.0
+        return max(
+            0.0,
+            self.device_recovery_seconds
+            - (time.monotonic() - self._runtime_device_override_at),
+        )
+
+    def _recover_auto_device_if_due(self) -> None:
+        """Retry automatic accelerator selection after a temporary CPU fallback."""
+        if self._device_recovery_retry_in_seconds() > 0.0:
+            return
+        if self.device_preference != "auto" or self._runtime_device_override is None:
+            return
+
+        with self._lock:
+            if self._device_recovery_retry_in_seconds() > 0.0:
+                return
+            if self.device_preference != "auto" or self._runtime_device_override is None:
+                return
+
+            logger.info(
+                "CPU device fallback cooldown expired; retrying automatic device selection."
+            )
+            self._runtime_device_override = None
+            self._runtime_device_override_at = None
+            # Drop the cached CPU runtime so the next load resolves auto again.
+            self._loaded = None
+            self._load_error = None
+            self._load_error_at = None
 
     def _invalidate_if_checkpoint_changed(self) -> None:
         """Drop the cached runtime when best_model.pt is replaced after training."""
@@ -191,6 +238,8 @@ class WasteClassifier:
             self._loaded = None
             self._known_checkpoint_hash = None
             self._loaded_checkpoint_signature = None
+            self._runtime_device_override = None
+            self._runtime_device_override_at = None
             self._load_error = None
             self._load_error_at = None
 
@@ -206,16 +255,16 @@ class WasteClassifier:
             return torch_module.device("cpu")
         if pref == "cuda":
             if not torch_module.cuda.is_available():
-                raise ModelUnavailableError("WASTE_DEVICE=cuda nhưng CUDA không khả dụng.")
+                raise ModelUnavailableError("WASTE_DEVICE=cuda, but CUDA is not available.")
             return torch_module.device("cuda")
         if pref == "mps":
             mps = getattr(torch_module.backends, "mps", None)
             if mps is None or not mps.is_available():
-                raise ModelUnavailableError("WASTE_DEVICE=mps nhưng Apple MPS không khả dụng.")
+                raise ModelUnavailableError("WASTE_DEVICE=mps, but Apple MPS is not available.")
             return torch_module.device("mps")
         if pref == "cpu":
             return torch_module.device("cpu")
-        raise ModelUnavailableError("WASTE_DEVICE phải là auto, cuda, mps hoặc cpu.")
+        raise ModelUnavailableError("WASTE_DEVICE must be auto, cuda, mps, or cpu.")
 
     def _ood_reference_matches_checkpoint(self, checkpoint_hash: str) -> bool:
         if not self.ood_reference_path.is_file():
@@ -236,8 +285,8 @@ class WasteClassifier:
             return
         if not self.ood_auto_build:
             raise FileNotFoundError(
-                f"Không tìm thấy OOD reference hợp lệ: {self.ood_reference_path}. "
-                "Hãy chạy training/build_ood_reference.py hoặc bật OOD_AUTO_BUILD=true."
+                f"No valid OOD reference found: {self.ood_reference_path}. "
+                "Run training/build_ood_reference.py or enable OOD_AUTO_BUILD=true."
             )
 
         # Import lazily so normal app startup does not pull training utilities unless
@@ -259,7 +308,7 @@ class WasteClassifier:
             device_preference=self._runtime_device_override or self.device_preference,
         )
         if not self._ood_reference_matches_checkpoint(checkpoint_hash):
-            raise RuntimeError("OOD reference vừa tạo không khớp checkpoint hiện tại.")
+            raise RuntimeError("The newly created OOD reference does not match the current checkpoint.")
 
     @staticmethod
     def _safe_torch_load(torch_module: Any, path: Path) -> dict[str, Any]:
@@ -271,7 +320,9 @@ class WasteClassifier:
             raise ValueError("Checkpoint must be a dictionary created by training/train.py")
         return payload
 
-    def _load(self) -> _LoadedModel:
+    def _load(self, *, allow_device_recovery: bool = True) -> _LoadedModel:
+        if allow_device_recovery:
+            self._recover_auto_device_if_due()
         self._invalidate_if_checkpoint_changed()
         if self._loaded is not None:
             return self._loaded
@@ -290,8 +341,8 @@ class WasteClassifier:
             try:
                 if not self.checkpoint_path.is_file():
                     raise FileNotFoundError(
-                        f"Không tìm thấy checkpoint: {self.checkpoint_path}. "
-                        "Hãy train bằng training/train.py rồi chép best_model.pt vào thư mục models/."
+                        f"Checkpoint not found: {self.checkpoint_path}. "
+                        "Train with training/train.py, then copy best_model.pt into the models/ directory."
                     )
 
                 import torch
@@ -303,15 +354,15 @@ class WasteClassifier:
                 class_names = tuple(str(x) for x in checkpoint.get("class_names", ()))
                 if class_names != WASTE_CLASS_KEYS:
                     raise ValueError(
-                        "Checkpoint class_names không khớp schema 11 lớp của project. "
+                        "Checkpoint class_names do not match the project's 11-class schema. "
                         f"Expected {WASTE_CLASS_KEYS}, got {class_names}."
                     )
                 if image_size < 64 or image_size > 1024:
-                    raise ValueError(f"image_size trong checkpoint không hợp lệ: {image_size}")
+                    raise ValueError(f"Invalid image_size in checkpoint: {image_size}")
 
                 state_dict = checkpoint.get("model_state_dict")
                 if not isinstance(state_dict, dict):
-                    raise ValueError("Checkpoint thiếu model_state_dict")
+                    raise ValueError("Checkpoint is missing model_state_dict")
 
                 checkpoint_hash = _file_sha256(self.checkpoint_path)
                 signature_after = self._checkpoint_signature()
@@ -345,8 +396,8 @@ class WasteClassifier:
                 if self.ood_enabled:
                     if not self.ood_reference_path.is_file():
                         raise FileNotFoundError(
-                            f"Không tìm thấy OOD reference: {self.ood_reference_path}. "
-                            "Hãy chạy training/build_ood_reference.py cho checkpoint hiện tại."
+                            f"OOD reference not found: {self.ood_reference_path}. "
+                            "Run training/build_ood_reference.py for the current checkpoint."
                         )
                     with np.load(self.ood_reference_path, allow_pickle=False) as reference:
                         stored_hash = str(reference["checkpoint_sha256"].item())
@@ -357,26 +408,26 @@ class WasteClassifier:
 
                     if stored_hash != checkpoint_hash:
                         raise ValueError(
-                            "OOD reference không khớp checkpoint hiện tại. "
-                            "Hãy tạo lại OOD reference cho checkpoint hiện tại."
+                            "OOD reference does not match the current checkpoint. "
+                            "Rebuild the OOD reference for the current checkpoint."
                         )
                     if stored_classes != class_names:
-                        raise ValueError("OOD reference class_names không khớp schema model.")
+                        raise ValueError("OOD reference class_names do not match the model schema.")
                     if embeddings.ndim != 2 or embeddings.shape[0] <= 0:
-                        raise ValueError("OOD reference embeddings không hợp lệ.")
+                        raise ValueError("OOD reference embeddings are invalid.")
                     if embeddings.shape[1] != int(feature_layer.in_features):
                         raise ValueError(
-                            "OOD reference feature dimension không khớp classifier head."
+                            "OOD reference feature dimension does not match the classifier head."
                         )
                     if labels.ndim != 1 or labels.shape[0] != embeddings.shape[0]:
-                        raise ValueError("OOD reference labels không khớp embeddings.")
+                        raise ValueError("OOD reference labels do not match the embeddings.")
                     if np.any(labels < 0) or np.any(labels >= len(class_names)):
-                        raise ValueError("OOD reference chứa class index không hợp lệ.")
+                        raise ValueError("OOD reference contains an invalid class index.")
                     if not np.isfinite(embeddings).all():
-                        raise ValueError("OOD reference chứa embedding không hữu hạn.")
+                        raise ValueError("OOD reference contains a non-finite embedding.")
                     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
                     if np.any(norms <= 1e-12):
-                        raise ValueError("OOD reference chứa embedding zero-norm.")
+                        raise ValueError("OOD reference contains a zero-norm embedding.")
                     embeddings = np.ascontiguousarray(embeddings / norms, dtype=np.float32)
                     threshold = (
                         self.ood_threshold_override
@@ -384,7 +435,7 @@ class WasteClassifier:
                         else stored_threshold
                     )
                     if not math.isfinite(threshold) or threshold < -1.0 or threshold > 1.0:
-                        raise ValueError(f"OOD threshold không hợp lệ: {threshold}")
+                        raise ValueError(f"Invalid OOD threshold: {threshold}")
                     ood_embeddings = embeddings
                     ood_labels = labels
                     ood_threshold = float(threshold)
@@ -420,7 +471,7 @@ class WasteClassifier:
                 self._load_error_at = time.monotonic()
                 raise
             except Exception as exc:
-                self._load_error = f"Không thể load model đã train. Chi tiết: {exc}"
+                self._load_error = f"Failed to load the trained model. Details: {exc}"
                 self._load_error_at = time.monotonic()
                 logger.exception("Could not load trained waste classifier")
                 raise ModelUnavailableError(self._load_error) from exc
@@ -461,6 +512,7 @@ class WasteClassifier:
             state = "not_loaded"
 
         loaded = self._loaded
+        device_fallback_retry_in_seconds = self._device_recovery_retry_in_seconds()
         return {
             "state": state,
             "model_type": "supervised-image-classifier",
@@ -468,6 +520,8 @@ class WasteClassifier:
             "architecture": loaded.architecture if loaded else None,
             "device": str(loaded.device) if loaded else (self._runtime_device_override or self.device_preference),
             "device_fallback_active": bool(self._runtime_device_override),
+            "device_recovery_seconds": self.device_recovery_seconds,
+            "device_fallback_retry_in_seconds": round(device_fallback_retry_in_seconds, 1),
             "image_size": loaded.image_size if loaded else None,
             "num_classes": len(WASTE_CLASS_KEYS),
             "class_names": list(WASTE_CLASS_KEYS),
@@ -480,6 +534,9 @@ class WasteClassifier:
             "unknown_threshold": self.unknown_threshold,
             "uncertainty_margin": self.uncertainty_margin,
             "ood_detection_enabled": self.ood_enabled,
+            "ood_class_mismatch_enabled": self.ood_class_mismatch_enabled,
+            "ood_class_mismatch_min_similarity": self.ood_class_mismatch_min_similarity,
+            "ood_class_mismatch_min_gap": self.ood_class_mismatch_min_gap,
             "ood_reference": loaded.ood_reference_path if loaded else str(self.ood_reference_path),
             "ood_min_similarity": loaded.ood_threshold if loaded else self.ood_threshold_override,
         }
@@ -534,7 +591,9 @@ class WasteClassifier:
         scores: list[float],
         embedding: tuple[float, ...],
     ) -> tuple[list[float], tuple[float, ...], dict[str, Any]]:
-        """Rescue small electronic accessories that a background dominates.
+        """Legacy full-frame rescue for direct classifier use only.
+
+        Rescue small electronic accessories that a background dominates.
 
         The current classifier is trained on single-object crops. In a phone camera
         photo, a small white charger on a large table can be classified as paper or
@@ -547,6 +606,7 @@ class WasteClassifier:
         base_key = loaded.class_names[base_index]
         info: dict[str, Any] = {
             "enabled": self.framing_rescue_enabled,
+            "allowed": True,
             "applied": False,
             "base_key": base_key,
             "base_confidence": round(float(scores[base_index]), 4),
@@ -611,6 +671,7 @@ class WasteClassifier:
                 self._loaded = None
             if self.device_preference == "auto" and getattr(loaded.device, "type", "") != "cpu":
                 self._runtime_device_override = "cpu"
+                self._runtime_device_override_at = time.monotonic()
                 self._load_error = None
                 self._load_error_at = None
                 retry_on_cpu = True
@@ -623,21 +684,46 @@ class WasteClassifier:
             logger.error("%s", message)
         return retry_on_cpu
 
-    def classify(self, image: Image.Image) -> ClassificationResult:
+    def classify(
+        self,
+        image: Image.Image,
+        *,
+        allow_framing_rescue: bool = True,
+    ) -> ClassificationResult:
         loaded = self._load()
         image = image.convert("RGB")
+
+        def maybe_apply_framing_rescue(
+            active_loaded: _LoadedModel,
+            active_scores: list[float],
+            active_embedding: tuple[float, ...],
+        ) -> tuple[list[float], tuple[float, ...], dict[str, Any]]:
+            if allow_framing_rescue:
+                return self._apply_framing_rescue(
+                    active_loaded, image, active_scores, active_embedding
+                )
+            base_index = int(np.argmax(np.asarray(active_scores, dtype=np.float32)))
+            return active_scores, active_embedding, {
+                "enabled": self.framing_rescue_enabled,
+                "allowed": False,
+                "applied": False,
+                "base_key": active_loaded.class_names[base_index],
+                "base_confidence": round(float(active_scores[base_index]), 4),
+                "reason": "disabled_for_detector_crop",
+                "views": [],
+            }
 
         framing_rescue: dict[str, Any] = {}
         try:
             scores, embedding = self._run_inference(loaded, image)
-            scores, embedding, framing_rescue = self._apply_framing_rescue(
-                loaded, image, scores, embedding
+            scores, embedding, framing_rescue = maybe_apply_framing_rescue(
+                loaded, scores, embedding
             )
         except Exception as exc:
             logger.exception("Trained-model inference failed")
             if self._handle_inference_failure(loaded, exc):
                 try:
-                    fallback_loaded = self._load()
+                    fallback_loaded = self._load(allow_device_recovery=False)
                 except Exception as retry_exc:
                     # _load() already recorded the load failure for health/status. Do
                     # not clear it by treating the old GPU runtime as the failed retry.
@@ -645,8 +731,8 @@ class WasteClassifier:
                     raise ModelUnavailableError(f"Model inference failed: {retry_exc}") from retry_exc
                 try:
                     scores, embedding = self._run_inference(fallback_loaded, image)
-                    scores, embedding, framing_rescue = self._apply_framing_rescue(
-                        fallback_loaded, image, scores, embedding
+                    scores, embedding, framing_rescue = maybe_apply_framing_rescue(
+                        fallback_loaded, scores, embedding
                     )
                     loaded = fallback_loaded
                 except Exception as retry_exc:
@@ -668,7 +754,10 @@ class WasteClassifier:
         margin = confidence - runner_up_score
         ood_similarity: float | None = None
         ood_nearest_key: str | None = None
+        ood_predicted_class_similarity: float | None = None
+        ood_class_similarity_gap: float | None = None
         ood_detected = False
+        ood_class_mismatch = False
         if (
             self.ood_enabled
             and loaded.ood_embeddings is not None
@@ -679,12 +768,30 @@ class WasteClassifier:
             similarities = loaded.ood_embeddings @ query
             nearest_index = int(np.argmax(similarities))
             ood_similarity = float(similarities[nearest_index])
-            ood_nearest_key = loaded.class_names[int(loaded.ood_labels[nearest_index])]
+            nearest_label = int(loaded.ood_labels[nearest_index])
+            ood_nearest_key = loaded.class_names[nearest_label]
             ood_detected = ood_similarity < loaded.ood_threshold
+
+            predicted_label = loaded.class_names.index(best_key)
+            predicted_mask = loaded.ood_labels == predicted_label
+            if bool(np.any(predicted_mask)):
+                ood_predicted_class_similarity = float(np.max(similarities[predicted_mask]))
+                ood_class_similarity_gap = ood_similarity - ood_predicted_class_similarity
+                mismatch_similarity_floor = max(
+                    float(loaded.ood_threshold),
+                    self.ood_class_mismatch_min_similarity,
+                )
+                ood_class_mismatch = bool(
+                    self.ood_class_mismatch_enabled
+                    and not ood_detected
+                    and ood_nearest_key != best_key
+                    and ood_similarity >= mismatch_similarity_floor
+                    and ood_class_similarity_gap >= self.ood_class_mismatch_min_gap
+                )
 
         low_confidence = confidence < self.unknown_threshold
         low_margin = margin < self.uncertainty_margin
-        uncertain = low_confidence or low_margin or ood_detected
+        uncertain = low_confidence or low_margin or ood_detected or ood_class_mismatch
         uncertainty_reasons: list[str] = []
         if low_confidence:
             uncertainty_reasons.append("low_confidence")
@@ -692,6 +799,8 @@ class WasteClassifier:
             uncertainty_reasons.append("low_margin")
         if ood_detected:
             uncertainty_reasons.append("out_of_distribution")
+        if ood_class_mismatch:
+            uncertainty_reasons.append("embedding_class_mismatch")
 
         alternatives = [
             {
@@ -722,6 +831,15 @@ class WasteClassifier:
                 if loaded.ood_threshold is not None
                 else None,
                 "nearest_reference_key": ood_nearest_key,
+                "predicted_class_similarity": round(ood_predicted_class_similarity, 4)
+                if ood_predicted_class_similarity is not None
+                else None,
+                "class_similarity_gap": round(ood_class_similarity_gap, 4)
+                if ood_class_similarity_gap is not None
+                else None,
+                "class_mismatch": ood_class_mismatch,
+                "class_mismatch_min_similarity": self.ood_class_mismatch_min_similarity,
+                "class_mismatch_min_gap": self.ood_class_mismatch_min_gap,
             },
             "checkpoint_id": loaded.checkpoint_hash[:12],
             "feature_dimension": len(embedding),

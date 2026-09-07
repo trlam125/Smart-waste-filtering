@@ -11,7 +11,15 @@ services:
     environment:
       DATABASE_PATH: /app/data/waste_scanner.db
       WASTE_MODEL_CHECKPOINT: /app/models/best_model.pt
+      WASTE_DETECTOR_CHECKPOINT: /app/models/best_detector.pt
       WASTE_DEVICE: ${WASTE_DEVICE:-cpu}
+      WASTE_DETECTOR_DEVICE: ${WASTE_DETECTOR_DEVICE:-cpu}
+      DETECTOR_CONFIDENCE: ${DETECTOR_CONFIDENCE:-0.45}
+      DETECTOR_IOU: ${DETECTOR_IOU:-0.45}
+      DETECTOR_IMAGE_SIZE: ${DETECTOR_IMAGE_SIZE:-640}
+      DETECTOR_MAX_DETECTIONS: ${DETECTOR_MAX_DETECTIONS:-8}
+      DETECTOR_MIN_BOX_AREA_RATIO: ${DETECTOR_MIN_BOX_AREA_RATIO:-0.015}
+      DETECTOR_CROP_PADDING: ${DETECTOR_CROP_PADDING:-0.08}
       OOD_DETECTION_ENABLED: ${OOD_DETECTION_ENABLED:-true}
       # Docker runtime is intentionally read-only for model assets. Build the OOD bank offline.
       OOD_AUTO_BUILD: "false"

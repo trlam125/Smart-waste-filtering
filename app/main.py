@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any
@@ -26,8 +27,9 @@ from .paths import PROJECT_ROOT, collection_pending_dir, resolve_project_path
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from .classifier import ModelUnavailableError, WasteClassifier
+from .detector import DetectorUnavailableError, WasteDetector
 from .database import (
-    add_scan_if_history_generation,
+    add_scans_if_history_generation,
     clear_scans,
     delete_scan,
     get_history_generation,
@@ -66,7 +68,7 @@ def _bool_env(name: str, default: bool) -> bool:
         return True
     if raw_value in {"0", "false", "no", "off"}:
         return False
-    raise RuntimeError(f"{name} phải là true/false, nhận được: {raw_value!r}")
+    raise RuntimeError(f"{name} must be true/false; received: {raw_value!r}")
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -74,9 +76,9 @@ def _positive_int_env(name: str, default: int) -> int:
     try:
         value = int(raw_value)
     except ValueError as exc:
-        raise RuntimeError(f"{name} phải là số nguyên dương, nhận được: {raw_value!r}") from exc
+        raise RuntimeError(f"{name} must be a positive integer; received: {raw_value!r}") from exc
     if value <= 0:
-        raise RuntimeError(f"{name} phải lớn hơn 0, nhận được: {value}")
+        raise RuntimeError(f"{name} must be greater than 0; received: {value}")
     return value
 
 
@@ -85,10 +87,10 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
     try:
         value = int(raw_value)
     except ValueError as exc:
-        raise RuntimeError(f"{name} phải là số nguyên, nhận được: {raw_value!r}") from exc
+        raise RuntimeError(f"{name} must be an integer; received: {raw_value!r}") from exc
     if value < minimum or value > maximum:
         raise RuntimeError(
-            f"{name} phải nằm trong khoảng {minimum}..{maximum}, nhận được: {value}"
+            f"{name} must be in the range {minimum}..{maximum}; received: {value}"
         )
     return value
 
@@ -96,6 +98,12 @@ def _bounded_int_env(name: str, default: int, minimum: int, maximum: int) -> int
 MAX_IMAGE_PIXELS = _positive_int_env("MAX_IMAGE_PIXELS", 20_000_000)
 PRELOAD_MODEL = _bool_env("PRELOAD_MODEL", True)
 CLASSIFIER_IMAGE_MAX_DIMENSION = _positive_int_env("CLASSIFIER_IMAGE_MAX_DIMENSION", 1024)
+CLASSIFIER_CROP_SOURCE_MAX_DIMENSION = _positive_int_env(
+    "CLASSIFIER_CROP_SOURCE_MAX_DIMENSION", 1600
+)
+CLASSIFIER_MIN_OBJECT_SHORT_SIDE = _positive_int_env(
+    "CLASSIFIER_MIN_OBJECT_SHORT_SIDE", 160
+)
 THUMBNAIL_MAX_DIMENSION = _positive_int_env("THUMBNAIL_MAX_DIMENSION", 480)
 THUMBNAIL_JPEG_QUALITY = _bounded_int_env("THUMBNAIL_JPEG_QUALITY", 80, 40, 95)
 HISTORY_DELETE_PASSWORD = os.getenv("HISTORY_DELETE_PASSWORD", "").strip()
@@ -134,8 +142,9 @@ def _require_history_delete_password(candidate: str | None) -> None:
         or not supplied
         or not hmac.compare_digest(supplied, HISTORY_DELETE_PASSWORD)
     ):
-        raise HTTPException(status_code=401, detail="Không đúng mật khẩu.")
+        raise HTTPException(status_code=401, detail="Incorrect password.")
 classifier = WasteClassifier()
+detector = WasteDetector()
 # Gate requests before they enter Starlette's shared threadpool. The classifier
 # still keeps its internal threading lock as a second line of protection.
 classification_gate = asyncio.Semaphore(1)
@@ -147,13 +156,13 @@ history_mutation_gate = asyncio.Lock()
 def _normalize_client_id(client_id: str | None) -> str:
     """Validate and return the required browser/device history scope."""
     if client_id is None:
-        raise HTTPException(status_code=400, detail="Thiếu header X-Client-ID.")
+        raise HTTPException(status_code=400, detail="Missing X-Client-ID header.")
 
     value = client_id.strip()
     if not value:
-        raise HTTPException(status_code=400, detail="X-Client-ID không được để trống.")
+        raise HTTPException(status_code=400, detail="X-Client-ID cannot be empty.")
     if value.lower() in RESERVED_CLIENT_IDS:
-        raise HTTPException(status_code=400, detail="X-Client-ID sử dụng giá trị dành riêng.")
+        raise HTTPException(status_code=400, detail="X-Client-ID uses a reserved value.")
     return value
 
 
@@ -190,24 +199,24 @@ def _save_scan_thumbnail(scan_id: int, client_id: str, image: Image.Image) -> bo
 def _decode_supported_image(content: bytes, *, label: str) -> Image.Image:
     """Validate an uploaded image and return an EXIF-corrected RGB copy."""
     if not content:
-        raise HTTPException(status_code=400, detail=f"{label} rỗng.")
+        raise HTTPException(status_code=400, detail=f"{label} is empty.")
     try:
         with Image.open(io.BytesIO(content)) as source:
             image_format = (source.format or "").upper()
             if image_format not in {"JPEG", "PNG", "WEBP"}:
                 raise HTTPException(
                     status_code=415,
-                    detail=f"{label} chỉ hỗ trợ JPEG, PNG hoặc WebP.",
+                    detail=f"{label} only supports JPEG, PNG, or WebP.",
                 )
             width, height = source.size
             if width <= 0 or height <= 0:
-                raise HTTPException(status_code=400, detail=f"{label} có kích thước không hợp lệ.")
+                raise HTTPException(status_code=400, detail=f"{label} has invalid dimensions.")
             if width * height > MAX_IMAGE_PIXELS:
                 raise HTTPException(
                     status_code=413,
                     detail=(
-                        f"{label} có độ phân giải quá lớn. "
-                        f"Giới hạn là {MAX_IMAGE_PIXELS:,} pixel."
+                        f"{label} has an excessively large resolution. "
+                        f"The limit is {MAX_IMAGE_PIXELS:,} pixel."
                     ),
                 )
             source.verify()
@@ -217,7 +226,7 @@ def _decode_supported_image(content: bytes, *, label: str) -> Image.Image:
     except HTTPException:
         raise
     except (UnidentifiedImageError, OSError, Image.DecompressionBombError) as exc:
-        raise HTTPException(status_code=400, detail=f"{label} không phải ảnh hợp lệ.") from exc
+        raise HTTPException(status_code=400, detail=f"{label} is not a valid image.") from exc
 
 
 def _save_pending_collection_image(scan_id: int, image: Image.Image) -> bool:
@@ -547,20 +556,24 @@ def _delete_all_managed_thumbnail_files() -> int:
     return deleted
 
 
-async def _preload_classifier() -> None:
-    # Let the web UI become responsive first, then warm the heavy model in the
-    # background so the first scan usually avoids model-load latency.
+async def _preload_models() -> None:
+    # Let the web UI become responsive first, then warm both AI stages in the
+    # background so the first multi-object scan avoids model-load latency.
     await asyncio.sleep(0.35)
+    try:
+        await run_in_threadpool(detector.warmup)
+    except DetectorUnavailableError as exc:
+        logger.warning("Background detector preload failed: %s", exc)
     try:
         await run_in_threadpool(classifier.warmup)
     except ModelUnavailableError as exc:
-        logger.warning("Background model preload failed: %s", exc)
+        logger.warning("Background classifier preload failed: %s", exc)
 
 
 @asynccontextmanager
 async def lifespan(app_: FastAPI):
     initialize_database()
-    preload_task = asyncio.create_task(_preload_classifier()) if PRELOAD_MODEL else None
+    preload_task = asyncio.create_task(_preload_models()) if PRELOAD_MODEL else None
     app_.state.model_preload_task = preload_task
     yield
     if preload_task and not preload_task.done():
@@ -569,8 +582,8 @@ async def lifespan(app_: FastAPI):
 
 app = FastAPI(
     title="Waste Scanner AI",
-    description="Ứng dụng quét và phân loại rác bằng camera.",
-    version="2.0.0",
+    description="Camera-based waste scanning and classification application.",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -591,21 +604,25 @@ async def disable_ui_cache(request, call_next):
 
 def _service_status_payload() -> dict[str, Any]:
     classifier_status = classifier.status
-    state = classifier_status["state"]
-    if state == "ready":
+    detector_status = detector.status
+    states = (detector_status["state"], classifier_status["state"])
+    ready = all(state == "ready" for state in states)
+    retry_available = any(state == "retry_available" for state in states)
+    if ready:
         status = "ok"
-    elif state in {"error", "retry_available"}:
+    elif any(state in {"error", "retry_available"} for state in states):
         status = "degraded"
     else:
         status = "starting"
     return {
         "status": status,
         "app": "waste-scanner-ai",
-        "version": "2.0.0",
+        "version": "3.0.0",
         "launch_token": os.getenv("WASTE_SCANNER_LAUNCH_TOKEN", ""),
         "pid": os.getpid(),
-        "ready": state == "ready",
-        "retry_available": state == "retry_available",
+        "ready": ready,
+        "retry_available": retry_available,
+        "detector": detector_status,
         "classifier": classifier_status,
         "learning": {
             "enabled": LEARNING_ENABLED,
@@ -638,15 +655,155 @@ def categories() -> list[dict[str, str]]:
     return [rule.public_dict() for rule in WASTE_RULES]
 
 
+def _expanded_bbox_normalized(
+    bbox: tuple[float, float, float, float],
+    padding: float,
+) -> tuple[float, float, float, float]:
+    x1, y1, x2, y2 = bbox
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+    pad_x = width * max(0.0, padding)
+    pad_y = height * max(0.0, padding)
+    return (
+        max(0.0, x1 - pad_x),
+        max(0.0, y1 - pad_y),
+        min(1.0, x2 + pad_x),
+        min(1.0, y2 + pad_y),
+    )
+
+
+def _crop_normalized(
+    image: Image.Image,
+    bbox: tuple[float, float, float, float],
+) -> Image.Image:
+    width, height = image.size
+    x1, y1, x2, y2 = bbox
+    left = max(0, min(width - 1, int(round(x1 * width))))
+    top = max(0, min(height - 1, int(round(y1 * height))))
+    right = max(left + 1, min(width, int(round(x2 * width))))
+    bottom = max(top + 1, min(height, int(round(y2 * height))))
+    return image.crop((left, top, right, bottom))
+
+
+def _bbox_pixel_size(
+    image: Image.Image,
+    bbox: tuple[float, float, float, float],
+) -> tuple[int, int]:
+    """Approximate detector-box pixel size on the classifier source image."""
+    width, height = image.size
+    x1, y1, x2, y2 = bbox
+    box_width = max(0, int(round(max(0.0, x2 - x1) * width)))
+    box_height = max(0, int(round(max(0.0, y2 - y1) * height)))
+    return box_width, box_height
+
+
+def _object_has_enough_pixels(
+    image: Image.Image,
+    bbox: tuple[float, float, float, float],
+) -> bool:
+    box_width, box_height = _bbox_pixel_size(image, bbox)
+    return min(box_width, box_height) >= CLASSIFIER_MIN_OBJECT_SHORT_SIDE
+
+
+def _same_aspect_ratio(
+    first: Image.Image,
+    second: Image.Image,
+    tolerance: float = 0.005,
+) -> bool:
+    """Return True when normalized detector boxes safely map between two images."""
+    first_width, first_height = first.size
+    second_width, second_height = second.size
+    if min(first_width, first_height, second_width, second_height) <= 0:
+        return False
+    first_ratio = first_width / first_height
+    second_ratio = second_width / second_height
+    return abs(first_ratio - second_ratio) / max(first_ratio, second_ratio) <= tolerance
+
+
+def _public_bbox(bbox: tuple[float, float, float, float]) -> dict[str, float]:
+    x1, y1, x2, y2 = bbox
+    return {
+        "x1": round(x1, 6),
+        "y1": round(y1, 6),
+        "x2": round(x2, 6),
+        "y2": round(y2, 6),
+        "width": round(max(0.0, x2 - x1), 6),
+        "height": round(max(0.0, y2 - y1), 6),
+    }
+
+
+def _needs_paper_consistency_check(result: Any) -> bool:
+    """Paper/cardboard are common background/material confusions; always verify them."""
+    return getattr(result, "key", None) in {"paper", "cardboard"}
+
+
+def _mark_result_uncertain(result: Any, reason: str) -> Any:
+    """Preserve model scores while safely abstaining after conflicting crop views."""
+    analysis = dict(getattr(result, "analysis", {}) or {})
+    reasons = list(analysis.get("uncertainty_reasons", []))
+    if reason not in reasons:
+        reasons.append(reason)
+    analysis["uncertainty_reasons"] = reasons
+    return replace(result, uncertain=True, analysis=analysis)
+
+
+def _object_notice(
+    *,
+    result: Any,
+    memory_info: dict[str, Any],
+    memory_applied: bool,
+    is_demo: bool,
+    persistence_enabled: bool,
+    history_saved: bool,
+    fallback_full_frame: bool = False,
+) -> str:
+    if result.uncertain:
+        notice = (
+            "Low-confidence result — the AI's best guess is shown. "
+            "Capture a clearer, well-lit image for higher accuracy."
+        )
+    else:
+        notice = "AI results are guidance only; always prioritize local waste-sorting regulations."
+
+    if fallback_full_frame:
+        notice += (
+            " No object was clearly detected, so the entire image was classified."
+            " For better accuracy, move the object closer to the camera."
+        )
+    if memory_applied:
+        matched = int(memory_info.get("matched_examples", 0))
+        notice += f" This result referenced {matched} confirmed samples in shared learning memory."
+    if is_demo:
+        notice += (
+            " This is a demo image: the result is not saved to history, "
+            "does not use feedback memory, and is not added to the dataset."
+        )
+    elif not persistence_enabled:
+        notice += (
+            " This result was requested without persistence, so it is not included in history, "
+            "feedback memory, or the dataset."
+        )
+    elif not history_saved:
+        notice += (
+            " History was cleared while the AI was processing the image, so this result was not "
+            "saved and cannot receive feedback; scan again if you want to keep the result."
+        )
+    return notice
+
+
 @app.post("/api/classify")
 async def classify_image(
-    image: Annotated[UploadFile, File(description="Ảnh chụp từ camera")],
+    image: Annotated[UploadFile, File(description="Image captured from the camera")],
+    classifier_image: Annotated[
+        UploadFile | None,
+        File(description="Optional high-quality image dedicated to the classifier"),
+    ] = None,
     collection_image: Annotated[
         UploadFile | None,
-        File(description="Ảnh chất lượng cao tùy chọn để lưu sau khi người dùng xác nhận nhãn"),
+        File(description="Optional high-quality image used only for dataset storage"),
     ] = None,
-    persist: Annotated[bool, Form(description="Có lưu lịch sử/feedback cho lần quét này hay không")] = True,
-    source: Annotated[str, Form(description="Nguồn ảnh: user hoặc demo")] = "user",
+    persist: Annotated[bool, Form(description="Whether to persist history/feedback for this scan")] = True,
+    source: Annotated[str, Form(description="Image source: user or demo")] = "user",
     client_id: Annotated[str | None, Header(alias="X-Client-ID", max_length=128)] = None,
 ) -> dict[str, Any]:
     history_scope = _normalize_client_id(client_id)
@@ -654,243 +811,469 @@ async def classify_image(
     is_demo = request_source == "demo"
     persistence_enabled = bool(persist) and not is_demo
 
-    # Only persistent user scans participate in history/feedback memory. Demo
-    # requests are intentionally side-effect free and cannot contaminate training
-    # data or shared k-NN memory.
     history_generation: int | None = None
     if persistence_enabled:
-        # Register this request before reading/decoding the image. Once registered,
-        # a later full-history clear invalidates persistence for this request.
         async with history_mutation_gate:
             history_generation = await run_in_threadpool(get_history_generation)
 
     content = await image.read(MAX_IMAGE_BYTES + 1)
     if not content:
-        raise HTTPException(status_code=400, detail="Ảnh rỗng.")
+        raise HTTPException(status_code=400, detail="Image is empty.")
     if len(content) > MAX_IMAGE_BYTES:
-        raise HTTPException(status_code=413, detail="Ảnh vượt quá giới hạn 8 MB.")
-    primary_full_image = _decode_supported_image(content, label="Ảnh phân loại")
-    pil_image = primary_full_image.copy()
-    pil_image.thumbnail(
+        raise HTTPException(status_code=413, detail="Image exceeds the 8 MB limit.")
+
+    primary_full_image = _decode_supported_image(content, label="Classification image")
+
+    # Keep detector inference lightweight, but classify each normalized detector
+    # box from a higher-resolution source so material texture/reflections are not
+    # destroyed before the 224x224 classifier preprocessing.
+    detector_image = primary_full_image.copy()
+    detector_image.thumbnail(
         (CLASSIFIER_IMAGE_MAX_DIMENSION, CLASSIFIER_IMAGE_MAX_DIMENSION),
         Image.Resampling.LANCZOS,
     )
+    classifier_source_image = primary_full_image.copy()
+    classifier_source_image.thumbnail(
+        (CLASSIFIER_CROP_SOURCE_MAX_DIMENSION, CLASSIFIER_CROP_SOURCE_MAX_DIMENSION),
+        Image.Resampling.LANCZOS,
+    )
 
-    # The UI may send a second, less-compressed/larger image exclusively for
-    # confirmed dataset collection. Failure of that optional payload must not
-    # block classification; fall back to the validated inference upload.
+    if classifier_image is not None:
+        try:
+            classifier_content = await classifier_image.read(MAX_COLLECTION_IMAGE_BYTES + 1)
+            if len(classifier_content) > MAX_COLLECTION_IMAGE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        "High-quality classifier image exceeds the limit "
+                        f"{MAX_COLLECTION_IMAGE_BYTES // (1024 * 1024)} MB."
+                    ),
+                )
+            high_quality_classifier_image = _decode_supported_image(
+                classifier_content,
+                label="High-quality classifier image",
+            )
+            if _same_aspect_ratio(primary_full_image, high_quality_classifier_image):
+                classifier_source_image = high_quality_classifier_image.copy()
+                classifier_source_image.thumbnail(
+                    (
+                        CLASSIFIER_CROP_SOURCE_MAX_DIMENSION,
+                        CLASSIFIER_CROP_SOURCE_MAX_DIMENSION,
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+            else:
+                logger.warning(
+                    "Ignoring optional classifier image because its aspect ratio differs "
+                    "from the detector image: primary=%s classifier=%s",
+                    primary_full_image.size,
+                    high_quality_classifier_image.size,
+                )
+        except HTTPException as exc:
+            logger.warning("Ignoring optional classifier image: %s", exc.detail)
+
     collection_source_image = primary_full_image
     collection_source = "inference_upload"
-    if persistence_enabled and collection_image is not None and DATASET_COLLECTION_ENABLED:
+    if persistence_enabled and collection_image is not None:
         try:
             collection_content = await collection_image.read(MAX_COLLECTION_IMAGE_BYTES + 1)
             if len(collection_content) > MAX_COLLECTION_IMAGE_BYTES:
                 raise HTTPException(
                     status_code=413,
                     detail=(
-                        "Ảnh lưu dataset vượt quá giới hạn "
+                        "High-quality image exceeds the limit "
                         f"{MAX_COLLECTION_IMAGE_BYTES // (1024 * 1024)} MB."
                     ),
                 )
-            collection_source_image = _decode_supported_image(
+            high_quality_collection_image = _decode_supported_image(
                 collection_content,
-                label="Ảnh lưu dataset",
+                label="High-quality image for dataset storage",
             )
-            collection_source = "high_quality_upload"
+            if _same_aspect_ratio(primary_full_image, high_quality_collection_image):
+                collection_source_image = high_quality_collection_image
+                collection_source = "high_quality_upload"
+            else:
+                logger.warning(
+                    "Ignoring optional collection image because its aspect ratio differs "
+                    "from the detector image: primary=%s collection=%s",
+                    primary_full_image.size,
+                    high_quality_collection_image.size,
+                )
         except HTTPException as exc:
             logger.warning("Ignoring optional collection image: %s", exc.detail)
 
+    records: list[dict[str, Any]] = []
+    detections: list[Any] = []
+    fallback_full_frame = False
+    skipped_small_detections = 0
+
     try:
         async with classification_gate:
-            base_result = await run_in_threadpool(classifier.classify, pil_image)
+            detections = await run_in_threadpool(detector.detect, detector_image)
+            if not detections:
+                # No YOLO detections — fall back to classifying the entire frame so
+                # the user always gets a result instead of a dead-end message.
+                fallback_full_frame = True
+                detections = []
+
+            eligible_detections = [
+                detection
+                for detection in detections
+                if _object_has_enough_pixels(
+                    classifier_source_image,
+                    detection.bbox_normalized,
+                )
+            ]
+            eligible_detection_count = len(eligible_detections)
+            skipped_small_detections = len(detections) - eligible_detection_count
+            if not eligible_detections:
+                # Either no detections at all, or every box was too small.
+                # Fall back to the full frame so the user always receives a result.
+                fallback_full_frame = True
+                # Synthesise a single full-frame "detection" with a sentinel bbox.
+                from dataclasses import dataclass as _dc
+
+                @_dc(frozen=True)
+                class _FullFrameDetection:
+                    confidence: float = 1.0
+                    bbox_xyxy: tuple = (0.0, 0.0, 1.0, 1.0)
+                    bbox_normalized: tuple = (0.0, 0.0, 1.0, 1.0)
+
+                eligible_detections = [_FullFrameDetection()]
+
+            for object_index, detection in enumerate(eligible_detections, start=1):
+                bbox = detection.bbox_normalized
+                crop_bbox = _expanded_bbox_normalized(bbox, detector.crop_padding)
+                object_image = _crop_normalized(classifier_source_image, crop_bbox)
+                detector_confidence = detection.confidence
+
+                base_result = await run_in_threadpool(
+                    classifier.classify,
+                    object_image,
+                    allow_framing_rescue=False,
+                )
+
+                crop_retry = {
+                    "attempted": False,
+                    "applied": False,
+                    "reason": "not_needed",
+                    "views": [],
+                }
+                if _needs_paper_consistency_check(base_result):
+                    crop_retry["attempted"] = True
+                    crop_retry["reason"] = "no_strong_consensus"
+                    retry_views = [
+                        (detector.crop_padding, crop_bbox, object_image, base_result),
+                    ]
+                    for retry_padding in (0.02, 0.16):
+                        if abs(retry_padding - detector.crop_padding) < 1e-6:
+                            continue
+                        retry_bbox = _expanded_bbox_normalized(bbox, retry_padding)
+                        retry_image = _crop_normalized(classifier_source_image, retry_bbox)
+                        retry_result = await run_in_threadpool(
+                            classifier.classify,
+                            retry_image,
+                            allow_framing_rescue=False,
+                        )
+                        retry_views.append(
+                            (retry_padding, retry_bbox, retry_image, retry_result)
+                        )
+
+                    for padding_value, _, _, retry_result in retry_views:
+                        crop_retry["views"].append(
+                            {
+                                "padding": round(float(padding_value), 4),
+                                "key": retry_result.key,
+                                "confidence": retry_result.confidence,
+                                "uncertain": retry_result.uncertain,
+                            }
+                        )
+
+                    # Paper/cardboard are common background confusions. Never turn an
+                    # uncertain paper-like prediction into a confident one from a
+                    # single alternate crop. Only accept a different class when two
+                    # crop views agree and at least one of them passes all classifier
+                    # uncertainty/OOD checks.
+                    candidate_keys = {
+                        retry_result.key
+                        for _, _, _, retry_result in retry_views
+                        if retry_result.key not in {"paper", "cardboard"}
+                    }
+                    selected_view = None
+                    for candidate_key in candidate_keys:
+                        agreeing = [
+                            view for view in retry_views if view[3].key == candidate_key
+                        ]
+                        certain = [view for view in agreeing if not view[3].uncertain]
+                        if len(agreeing) < 2 or not certain:
+                            continue
+                        best_view = max(certain, key=lambda view: view[3].confidence)
+                        if selected_view is None or best_view[3].confidence > selected_view[3].confidence:
+                            selected_view = best_view
+
+                    if selected_view is not None:
+                        selected_padding, crop_bbox, object_image, base_result = selected_view
+                        crop_retry["applied"] = True
+                        crop_retry["reason"] = "two_crop_views_agree_on_non_paper_class"
+                        crop_retry["selected_padding"] = round(float(selected_padding), 4)
+                        crop_retry["selected_key"] = base_result.key
+                        crop_retry["selected_confidence"] = base_result.confidence
+                    elif not base_result.uncertain:
+                        # A confident paper/cardboard result is not trustworthy when
+                        # both alternate framings independently classify it as
+                        # something else. If those alternates disagree with each
+                        # other, abstain instead of inventing an override class.
+                        alternate_non_paper = [
+                            view
+                            for view in retry_views[1:]
+                            if view[3].key not in {"paper", "cardboard"}
+                        ]
+                        if len(alternate_non_paper) == len(retry_views) - 1:
+                            base_result = _mark_result_uncertain(
+                                base_result,
+                                "paper_crop_inconsistency",
+                            )
+                            crop_retry["reason"] = "alternate_crops_reject_paper_without_consensus"
+
+                records.append(
+                    {
+                        "object_index": object_index,
+                        "detected": not fallback_full_frame,
+                        "detector_confidence": detector_confidence,
+                        "bbox": bbox,
+                        "crop_bbox": crop_bbox,
+                        "object_image": object_image,
+                        "base_result": base_result,
+                        "result": base_result,
+                        "crop_retry": crop_retry,
+                        "scan_id": None,
+                        "thumbnail_stored": False,
+                        "embedding_stored": False,
+                        "collection_pending_stored": False,
+                    }
+                )
+    except DetectorUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    result = base_result
     generation_still_current = False
     if persistence_enabled and history_generation is not None:
         generation_still_current = (
             await run_in_threadpool(get_history_generation) == history_generation
         )
-    if (
-        persistence_enabled
-        and generation_still_current
-        and LEARNING_ENABLED
-        and result.embedding
-        and result.embedding_kind
-    ):
-        examples = await run_in_threadpool(
-            get_learning_examples,
-            result.embedding_kind,
-            LEARNING_MAX_EXAMPLES,
-        )
-        result = await run_in_threadpool(
-            apply_feedback_memory,
-            result,
-            embedding=result.embedding,
-            embedding_kind=result.embedding_kind,
-            examples=examples,
-            unknown_threshold=classifier.unknown_threshold,
-            uncertainty_margin=classifier.uncertainty_margin,
-        )
 
-    rule = RULE_BY_KEY[result.key]
-    base_rule = RULE_BY_KEY[base_result.key]
-    memory_info = result.analysis.get("learning_memory", {})
-    memory_applied = bool(memory_info.get("applied"))
-    stored_category = "Chưa xác định" if result.uncertain else rule.category
-    thumbnail_stored = False
-    embedding_stored = False
-    collection_pending_stored = False
+    learning_examples_cache: dict[str, list[dict[str, Any]]] = {}
+    if persistence_enabled and generation_still_current and LEARNING_ENABLED:
+        for record in records:
+            result = record["result"]
+            if not result.embedding or not result.embedding_kind:
+                continue
+            examples = learning_examples_cache.get(result.embedding_kind)
+            if examples is None:
+                examples = await run_in_threadpool(
+                    get_learning_examples,
+                    result.embedding_kind,
+                    LEARNING_MAX_EXAMPLES,
+                )
+                learning_examples_cache[result.embedding_kind] = examples
+            record["result"] = await run_in_threadpool(
+                apply_feedback_memory,
+                result,
+                embedding=result.embedding,
+                embedding_kind=result.embedding_kind,
+                examples=examples,
+                unknown_threshold=classifier.unknown_threshold,
+                uncertainty_margin=classifier.uncertainty_margin,
+            )
+
     history_saved = False
-    scan_id: int | None = None
     if persistence_enabled and history_generation is not None:
         async with history_mutation_gate:
-            scan_id = await run_in_threadpool(
-                add_scan_if_history_generation,
-                rule.key,
-                rule.display_name,
-                stored_category,
-                base_result.confidence,
-                result.uncertain,
-                base_result.key,
-                base_result.confidence,
-                base_result.uncertain,
-                result.confidence,
-                memory_applied,
+            scan_rows: list[dict[str, Any]] = []
+            for record in records:
+                base_result = record["base_result"]
+                result = record["result"]
+                rule = RULE_BY_KEY[result.key]
+                memory_info = result.analysis.get("learning_memory", {})
+                scan_rows.append(
+                    {
+                        "waste_key": rule.key,
+                        "display_name": rule.display_name,
+                        "category": rule.category,
+                        "confidence": result.confidence,
+                        "uncertain": result.uncertain,
+                        "model_waste_key": base_result.key,
+                        "model_confidence": base_result.confidence,
+                        "model_uncertain": base_result.uncertain,
+                        "effective_score": result.confidence,
+                        "memory_applied": bool(memory_info.get("applied")),
+                    }
+                )
+
+            scan_ids = await run_in_threadpool(
+                add_scans_if_history_generation,
+                scan_rows,
                 history_scope,
                 history_generation,
             )
-            if scan_id is not None:
+            if scan_ids is not None and len(scan_ids) == len(records):
                 history_saved = True
-                thumbnail_stored = await run_in_threadpool(
-                    _save_scan_thumbnail,
-                    scan_id,
-                    history_scope,
-                    pil_image,
-                )
-                if DATASET_COLLECTION_ENABLED:
-                    collection_pending_stored = await run_in_threadpool(
-                        _save_pending_collection_image,
+                for record, scan_id in zip(records, scan_ids):
+                    record["scan_id"] = scan_id
+                    record["thumbnail_stored"] = await run_in_threadpool(
+                        _save_scan_thumbnail,
                         scan_id,
-                        collection_source_image,
+                        history_scope,
+                        record["object_image"],
                     )
-                if LEARNING_ENABLED and result.embedding and result.embedding_kind:
-                    try:
-                        embedding_stored = await run_in_threadpool(
-                            store_scan_embedding,
-                            scan_id,
-                            history_scope,
-                            result.embedding_kind,
-                            result.embedding,
+                    if DATASET_COLLECTION_ENABLED:
+                        collection_crop = _crop_normalized(
+                            collection_source_image,
+                            record["crop_bbox"],
                         )
-                    except sqlite3.Error:
-                        # The scan itself has already been committed. Embedding persistence is
-                        # optional metadata, so a transient DB failure must not make the client
-                        # believe that the whole classification failed and retry the scan.
-                        logger.exception("Could not store embedding for scan_id=%s", scan_id)
-                        embedding_stored = False
+                        record["collection_pending_stored"] = await run_in_threadpool(
+                            _save_pending_collection_image,
+                            scan_id,
+                            collection_crop,
+                        )
+                    result = record["result"]
+                    if LEARNING_ENABLED and result.embedding and result.embedding_kind:
+                        try:
+                            record["embedding_stored"] = await run_in_threadpool(
+                                store_scan_embedding,
+                                scan_id,
+                                history_scope,
+                                result.embedding_kind,
+                                result.embedding,
+                            )
+                        except sqlite3.Error:
+                            logger.exception("Could not store embedding for scan_id=%s", scan_id)
+                            record["embedding_stored"] = False
 
     if persistence_enabled and not history_saved:
-        # A clear occurred after this request started. Do not let feedback memory
-        # from the pre-clear generation influence the visible post-clear result.
-        result = base_result
+        # A full-history clear after inference invalidates feedback-memory fusion
+        # for every object from this camera frame. Keep the visible frame internally
+        # consistent by reverting all objects to their calibrated model prediction.
+        for record in records:
+            record["result"] = record["base_result"]
+            record["scan_id"] = None
+            record["thumbnail_stored"] = False
+            record["embedding_stored"] = False
+            record["collection_pending_stored"] = False
+
+    objects: list[dict[str, Any]] = []
+    for record in records:
+        base_result = record["base_result"]
+        result = record["result"]
         rule = RULE_BY_KEY[result.key]
-        base_rule = rule
+        base_rule = RULE_BY_KEY[base_result.key]
         memory_info = result.analysis.get("learning_memory", {})
-        memory_applied = False
-        scan_id = None
-        thumbnail_stored = False
-        embedding_stored = False
-        collection_pending_stored = False
+        memory_applied = bool(memory_info.get("applied"))
+        public_rule = rule.public_dict()
+        if result.uncertain:
+            # Still show the best prediction — just flag it as low-confidence so
+            # the user can make an informed decision rather than seeing nothing.
+            uncertainty_reasons = result.analysis.get("uncertainty_reasons", [])
+            public_rule = {
+                **public_rule,
+                "low_confidence": True,
+                "uncertainty_reasons": uncertainty_reasons,
+                "instruction": (
+                    f"Low-confidence result ({rule.display_name}). "
+                    "Verify with local waste-sorting regulations or try again with a clearer image."
+                ),
+            }
 
-    if result.uncertain:
-        notice = (
-            "AI chưa đủ chắc chắn về kết quả này. Hãy chụp gần hơn, đủ sáng và chỉ để "
-            "một vật thể trong khung trước khi quyết định cách phân loại."
-        )
-    else:
-        notice = "Kết quả AI chỉ mang tính gợi ý; hãy ưu tiên quy định phân loại tại địa phương."
-
-    if memory_applied:
-        matched = int(memory_info.get("matched_examples", 0))
-        notice += f" Kết quả này đã tham khảo {matched} mẫu đã xác nhận trong bộ nhớ dùng chung."
-
-    if is_demo:
-        notice += (
-            " Đây là ảnh minh họa dùng thử: kết quả không được lưu vào lịch sử, "
-            "không dùng bộ nhớ phản hồi và không được thêm vào dataset."
-        )
-    elif not persistence_enabled:
-        notice += (
-            " Kết quả này được yêu cầu không lưu, nên không tham gia lịch sử, "
-            "bộ nhớ phản hồi hoặc dataset."
-        )
-    elif not history_saved:
-        notice += (
-            " Lịch sử đã được xóa trong lúc AI xử lý ảnh nên kết quả này không được "
-            "lưu và không thể phản hồi; hãy quét lại nếu bạn muốn lưu kết quả."
-        )
-
-    public_rule = rule.public_dict()
-    if result.uncertain:
-        public_rule = {
+        object_payload = {
+            "object_index": int(record["object_index"]),
+            "object_id": f"object-{int(record['object_index'])}",
+            "scan_id": record["scan_id"],
+            "history_saved": history_saved,
+            "source": request_source,
+            "persistence_enabled": persistence_enabled,
+            "detected": bool(record["detected"]),
+            "fallback_full_frame": fallback_full_frame,
+            "detector_confidence": record["detector_confidence"],
+            "bbox": _public_bbox(record["bbox"]),
+            "crop_bbox": _public_bbox(record["crop_bbox"]),
             **public_rule,
-            "category": "Chưa xác định",
-            "bin_name": "Chưa xác định",
-            "instruction": "Chưa đưa ra hướng dẫn xử lý cho đến khi vật thể được nhận dạng chắc chắn hơn.",
-        }
-
-    return {
-        "scan_id": scan_id,
-        "history_saved": history_saved,
-        "source": request_source,
-        "persistence_enabled": persistence_enabled,
-        **public_rule,
-        # Keep the top-level prediction internally consistent: identity, score,
-        # alternatives and uncertainty all describe the effective result after
-        # feedback-memory fusion. The original calibrated model prediction is
-        # preserved separately under ``model_prediction``.
-        "predicted_category": rule.category,
-        "confidence": result.confidence,
-        "uncertain": result.uncertain,
-        "model_uncertain": base_result.uncertain,
-        "alternatives": result.alternatives,
-        "model_prediction": {
-            "key": base_result.key,
-            "display_name": base_rule.display_name,
-            "category": base_rule.category,
-            "confidence": base_result.confidence,
-            "uncertain": base_result.uncertain,
-            "alternatives": base_result.alternatives,
-        },
-        "effective_prediction": {
-            "key": result.key,
-            "display_name": rule.display_name,
-            "category": rule.category,
-            "score": result.confidence,
+            "predicted_category": rule.category,
+            "confidence": result.confidence,
             "uncertain": result.uncertain,
+            "model_uncertain": base_result.uncertain,
             "alternatives": result.alternatives,
-            "memory_applied": memory_applied,
-        },
-        "effective_score": result.confidence,
-        "analysis": result.analysis,
-        "learning": {
-            "enabled": LEARNING_ENABLED,
-            "feedback_available": embedding_stored,
-            "memory_applied": memory_applied,
-            "matched_examples": int(memory_info.get("matched_examples", 0)),
-        },
-        "history_thumbnail_available": thumbnail_stored,
-        "dataset_collection": {
-            "enabled": DATASET_COLLECTION_ENABLED,
-            "pending": collection_pending_stored,
-            "saved": False,
-            "source": collection_source if collection_pending_stored else None,
-        },
-        "notice": notice,
-    }
+            "model_prediction": {
+                "key": base_result.key,
+                "display_name": base_rule.display_name,
+                "category": base_rule.category,
+                "confidence": base_result.confidence,
+                "uncertain": base_result.uncertain,
+                "alternatives": base_result.alternatives,
+            },
+            "effective_prediction": {
+                "key": result.key,
+                "display_name": rule.display_name,
+                "category": rule.category,
+                "score": result.confidence,
+                "uncertain": result.uncertain,
+                "alternatives": result.alternatives,
+                "memory_applied": memory_applied,
+            },
+            "effective_score": result.confidence,
+            "analysis": result.analysis,
+            "crop_retry": record.get("crop_retry", {}),
+            "learning": {
+                "enabled": LEARNING_ENABLED,
+                "feedback_available": bool(record["embedding_stored"]),
+                "memory_applied": memory_applied,
+                "matched_examples": int(memory_info.get("matched_examples", 0)),
+            },
+            "history_thumbnail_available": bool(record["thumbnail_stored"]),
+            "dataset_collection": {
+                "enabled": DATASET_COLLECTION_ENABLED,
+                "pending": bool(record["collection_pending_stored"]),
+                "saved": False,
+                "source": collection_source if record["collection_pending_stored"] else None,
+            },
+            "notice": _object_notice(
+                result=result,
+                memory_info=memory_info,
+                memory_applied=memory_applied,
+                is_demo=is_demo,
+                persistence_enabled=persistence_enabled,
+                history_saved=history_saved,
+                fallback_full_frame=fallback_full_frame,
+            ),
+        }
+        objects.append(object_payload)
 
+    primary = objects[0]
+    return {
+        **primary,
+        "object_count": len(objects),
+        "objects": objects,
+        "scan_ids": [item["scan_id"] for item in objects if item.get("scan_id")],
+        "history_saved": history_saved,
+        "detector": {
+            "detected_count": len(detections),
+            "eligible_count": eligible_detection_count,
+            "skipped_small_detections": skipped_small_detections,
+            "fallback_full_frame": fallback_full_frame,
+            "confidence_threshold": detector.confidence_threshold,
+            "iou_threshold": detector.iou_threshold,
+            "image_size": detector.image_size,
+            "max_detections": detector.max_detections,
+            "min_box_area_ratio": detector.min_box_area_ratio,
+            "multi_pass_enabled": detector.multi_pass_enabled,
+            "multi_pass_trigger_count": detector.multi_pass_trigger_count,
+            "multi_pass_confidence": detector.multi_pass_confidence,
+            "multi_pass_splits": detector.multi_pass_splits,
+            "multi_pass_overlap": detector.multi_pass_overlap,
+            "merge_iou_threshold": detector.merge_iou_threshold,
+            "classifier_min_object_short_side": CLASSIFIER_MIN_OBJECT_SHORT_SIDE,
+        },
+    }
 
 @app.post("/api/feedback")
 async def submit_feedback(
@@ -898,7 +1281,7 @@ async def submit_feedback(
 ) -> dict[str, Any]:
     correct_key = payload.correct_key.strip()
     if correct_key not in RULE_BY_KEY:
-        raise HTTPException(status_code=400, detail="Loại rác phản hồi không hợp lệ.")
+        raise HTTPException(status_code=400, detail="The feedback waste type is invalid.")
 
     collection_result: dict[str, Any] = {
         "enabled": DATASET_COLLECTION_ENABLED,
@@ -921,7 +1304,7 @@ async def submit_feedback(
                 bool(saved["is_correct"]),
             )
     if saved is None:
-        raise HTTPException(status_code=404, detail="Không tìm thấy lần quét này trong lịch sử dùng chung.")
+        raise HTTPException(status_code=404, detail="This scan was not found in shared history.")
 
     compatible_kinds = classifier.learning_embedding_kinds()
     embedding_kind = saved.get("embedding_kind")
@@ -944,29 +1327,29 @@ async def submit_feedback(
     target_rule = RULE_BY_KEY[correct_key]
     target_name = target_rule.display_name
     if correct_key not in LEARNABLE_RULE_KEYS:
-        message = f"Đã lưu phản hồi: {target_name}, nhưng nhãn này không thuộc schema model hiện tại."
+        message = f"Feedback saved: {target_name}, but this label is not part of the current model schema."
     elif learnable and LEARNING_ENABLED:
-        message = f"Đã ghi nhớ phản hồi: {target_name}. Các ảnh tương tự sau này có thể dùng mẫu này để điều chỉnh kết quả."
+        message = f"Feedback learned: {target_name}. Similar images can use this sample to adjust future results."
     elif not has_embedding:
-        message = f"Đã lưu phản hồi: {target_name}, nhưng lần quét này không có embedding để dùng làm mẫu học."
+        message = f"Feedback saved: {target_name}, but this scan has no embedding to use as a learning sample."
     elif not learnable:
-        message = f"Đã lưu phản hồi: {target_name}, nhưng embedding cũ không tương thích với model hiện tại nên không được dùng để điều chỉnh lần quét sau."
+        message = f"Feedback saved: {target_name}, but the old embedding is incompatible with the current model and will not be used to adjust future scans."
     else:
-        message = f"Đã lưu phản hồi: {target_name}. Chức năng học từ phản hồi hiện đang tắt nên mẫu này chưa được dùng để điều chỉnh các lần quét sau."
+        message = f"Feedback saved: {target_name}. Feedback learning is currently disabled, so this sample is not being used to adjust future scans."
 
     if collection_result.get("saved"):
-        message += " Ảnh đã được lưu vào bộ dữ liệu thực tế để dùng cho lần fine-tune sau."
+        message += " The image was saved to the real-world dataset for the next fine-tuning run."
     elif DATASET_COLLECTION_ENABLED:
         collection_reason = collection_result.get("reason")
         if collection_reason == "storage_error":
             message += (
-                " Phản hồi đã được lưu, nhưng ảnh chưa thể ghi vào bộ dữ liệu thực tế "
-                "do lỗi lưu trữ. Vui lòng thử lại sau."
+                " Feedback was saved, but the image could not be written to the real-world dataset "
+                "because of a storage error. Please try again later."
             )
         elif collection_reason == "source_missing":
             message += (
-                " Không tìm thấy ảnh nguồn để thêm vào bộ dữ liệu thực tế "
-                "(có thể đây là lịch sử tạo trước bản cập nhật này)."
+                " The source image could not be found for addition to the real-world dataset "
+                "(this may be a history entry created before this update)."
             )
 
     return {
@@ -1020,12 +1403,12 @@ def history(
 def history_thumbnail(scan_id: int) -> FileResponse:
     exists, filename = get_scan_thumbnail_state(scan_id)
     if not exists:
-        raise HTTPException(status_code=404, detail="Không tìm thấy lần quét này trong lịch sử.")
+        raise HTTPException(status_code=404, detail="This scan was not found in history.")
     if not filename:
-        raise HTTPException(status_code=404, detail="Lần quét này không có ảnh xem trước.")
+        raise HTTPException(status_code=404, detail="This scan has no preview image.")
     path = _thumbnail_path(filename)
     if path is None:
-        raise HTTPException(status_code=404, detail="Ảnh xem trước không còn tồn tại.")
+        raise HTTPException(status_code=404, detail="The preview image no longer exists.")
     return FileResponse(
         path,
         media_type="image/jpeg",
@@ -1039,13 +1422,13 @@ async def delete_history_item(
     delete_password: Annotated[str | None, Header(alias="X-Delete-Password")] = None,
 ) -> dict[str, Any]:
     if scan_id <= 0:
-        raise HTTPException(status_code=400, detail="ID lần quét không hợp lệ.")
+        raise HTTPException(status_code=400, detail="Invalid scan ID.")
     _require_history_delete_password(delete_password)
 
     async with history_mutation_gate:
         deleted = await run_in_threadpool(delete_scan, scan_id)
         if deleted is None:
-            raise HTTPException(status_code=404, detail="Không tìm thấy lần quét này trong lịch sử dùng chung.")
+            raise HTTPException(status_code=404, detail="This scan was not found in shared history.")
 
         filenames = [f"scan_{scan_id}.jpg"]
         linked_thumbnail = deleted.get("thumbnail_name")

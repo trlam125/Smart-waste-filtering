@@ -92,12 +92,27 @@ def _runtime_env_path(
 
 
 def dataset_extract_dir(*, colab: bool | None = None) -> Path:
+    """Disposable extraction directory for the classifier dataset ZIP."""
     return _runtime_env_path(
         "SMARTWASTE_DATASET_EXTRACT_DIR",
-        "dataset_extracted",
+        "classifier_dataset_extracted",
         colab=colab,
-        legacy_project_defaults=("data/dataset/_extracted",),
-        local_default="data/dataset/_extracted",
+        legacy_project_defaults=(
+            "data/dataset/_extracted",
+            "data/.runtime/dataset_extracted",
+        ),
+        local_default="data/.runtime/classifier_dataset_extracted",
+    )
+
+
+def detector_dataset_extract_dir(*, colab: bool | None = None) -> Path:
+    """Disposable extraction directory for the YOLO detector dataset ZIP."""
+    return _runtime_env_path(
+        "SMARTWASTE_DETECTOR_DATASET_EXTRACT_DIR",
+        "detector_dataset_extracted",
+        colab=colab,
+        legacy_project_defaults=(),
+        local_default="data/.runtime/detector_dataset_extracted",
     )
 
 
@@ -143,11 +158,19 @@ def training_output_dir(
     *,
     colab: bool | None = None,
 ) -> Path:
-    return (
-        PROJECT_ROOT
-        / "runs"
-        / architecture
-    ).resolve()
+    """Training artifacts stay on fast disposable VM storage in Colab."""
+    detected = is_google_colab() if colab is None else bool(colab)
+    if detected:
+        return (runtime_root(colab=True) / "training" / architecture).resolve()
+    return (PROJECT_ROOT / "runs" / architecture).resolve()
+
+
+def detector_training_output_dir(*, colab: bool | None = None) -> Path:
+    """Return the YOLO run parent, using /content on Colab and runs/ locally."""
+    detected = is_google_colab() if colab is None else bool(colab)
+    if detected:
+        return (runtime_root(colab=True) / "training" / "detector").resolve()
+    return (PROJECT_ROOT / "runs" / "detector").resolve()
 
 
 def collection_pending_dir(collected_data_dir: Path, *, colab: bool | None = None) -> Path:

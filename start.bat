@@ -30,27 +30,27 @@ if not defined PYTHON_BOOTSTRAP (
 )
 
 if not defined PYTHON_BOOTSTRAP (
-  echo Khong tim thay Python. Hay cai Python 3.11 hoac 3.12 truoc.
+  echo Python was not found. Install Python 3.11 or 3.12 first.
   pause
   exit /b 1
 )
 
 if not defined VENV_READY (
   if exist "%VENV_PYTHON%" (
-    echo Moi truong .venv hien tai bi hong, dang sua bang Python vua tim thay...
+    echo The current .venv is broken; repairing it with the detected Python installation...
     %PYTHON_BOOTSTRAP% -m venv --upgrade ".venv"
     if errorlevel 1 (
-      echo Khong the tu dong sua .venv. Hay doi ten hoac xoa thu muc .venv roi chay lai start.bat setup.
+      echo Could not repair .venv automatically. Rename or delete the .venv folder, then run start.bat setup again.
       goto :error
     )
   ) else (
-    echo Dang tao moi truong .venv...
+    echo Creating .venv virtual environment...
     %PYTHON_BOOTSTRAP% -m venv ".venv"
     if errorlevel 1 goto :error
   )
 )
 
-echo Dang cai/cap nhat thu vien...
+echo Installing/updating dependencies...
 "%VENV_PYTHON%" -m pip install --upgrade pip
 if errorlevel 1 goto :error
 "%VENV_PYTHON%" -m pip install -r requirements.txt
@@ -58,7 +58,7 @@ if errorlevel 1 goto :error
 
 if /I "%~1"=="setup" (
   echo.
-  echo Da cai dat xong moi truong.
+  echo Environment setup completed.
   exit /b 0
 )
 
@@ -71,8 +71,8 @@ if /I "%~1"=="configure" goto :configure
 if /I "%~1"=="dev" goto :dev
 if /I "%~1"=="reload" goto :dev
 if not "%~1"=="" (
-  echo Tuy chon khong hop le: %~1
-  echo Dung: start.bat ^| start.bat dev ^| start.bat setup ^| start.bat clean ^| start.bat configure ^| start.bat ngrok
+  echo Invalid option: %~1
+  echo Usage: start.bat ^| start.bat dev ^| start.bat setup ^| start.bat clean ^| start.bat configure ^| start.bat ngrok
   exit /b 2
 )
 
@@ -86,7 +86,7 @@ exit /b %errorlevel%
 :clean
 if not exist "%VENV_PYTHON%" goto :setup
 echo.
-echo Dang don tien trinh cu tren port da cau hinh...
+echo Cleaning up the previous process on the configured port...
 "%VENV_PYTHON%" launcher.py --kill-port
 exit /b %errorlevel%
 
@@ -99,7 +99,7 @@ exit /b %EXIT_CODE%
 :ngrok
 "%VENV_PYTHON%" -c "import pyngrok" >nul 2>nul
 if errorlevel 1 (
-  echo Dang cai pyngrok cho che do ngrok...
+  echo Installing pyngrok for ngrok mode...
   "%VENV_PYTHON%" -m pip install "pyngrok>=8.1,<9.0"
   if errorlevel 1 goto :error
 )
@@ -110,6 +110,6 @@ exit /b %EXIT_CODE%
 
 :error
 echo.
-echo Cai dat hoac khoi dong that bai. Xem thong bao loi phia tren.
+echo Setup or startup failed. See the error message above.
 pause
 exit /b 1

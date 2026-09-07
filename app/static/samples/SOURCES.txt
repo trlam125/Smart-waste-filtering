@@ -1,0 +1,31 @@
+Smart Waste Scanner demo image sources
+
+plastic-bottle.jpg
+- Source: Wikimedia Commons, File:Bottle of Water.jpg
+- Author: Jiafei Slay Queen
+- License: CC0 1.0 Universal Public Domain Dedication
+- URL: https://commons.wikimedia.org/wiki/File:Bottle_of_Water.jpg
+- Modification: EXIF orientation normalized and resized/compressed for the web demo.
+
+cardboard-box.jpg
+- Source: Wikimedia Commons, File:Cardboard box.jpg
+- Author: MrBeastRapper
+- License: Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+- URL: https://commons.wikimedia.org/wiki/File:Cardboard_box.jpg
+- License URL: https://creativecommons.org/licenses/by-sa/4.0/
+- Modification: EXIF orientation normalized and resized/compressed for the web demo.
+- The adapted cardboard-box.jpg remains licensed under CC BY-SA 4.0.
+
+aluminum-can.jpg
+- Source: Wikimedia Commons, File:Recyclable finnish aluminium can.jpg
+- Author: Fourteenzerozero
+- License: CC0 1.0 Universal Public Domain Dedication
+- URL: https://commons.wikimedia.org/wiki/File:Recyclable_finnish_aluminium_can.jpg
+- Modification: EXIF orientation normalized and resized/compressed for the web demo.
+
+fruit-peel.jpg
+- Source: Wikimedia Commons, File:Consumer Food Waste.JPG
+- Author: Wormsandstuff
+- License: CC0 1.0 Universal Public Domain Dedication
+- URL: https://commons.wikimedia.org/wiki/File:Consumer_Food_Waste.JPG
+- Modification: EXIF orientation normalized and resized/compressed for the web demo.

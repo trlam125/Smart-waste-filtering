@@ -9,9 +9,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.class_schema import WASTE_CLASS_KEYS  # noqa: E402
-from training.dataset_utils import DEFAULT_DATASET_SOURCE, prepare_dataset  # noqa: E402
-
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+from training.dataset_utils import (  # noqa: E402
+    DEFAULT_DATASET_SOURCE,
+    IMAGE_EXTENSIONS,
+    dataset_content_fingerprint,
+    prepare_dataset,
+)
 
 
 def main() -> int:
@@ -20,7 +23,7 @@ def main() -> int:
         "--data",
         type=Path,
         default=DEFAULT_DATASET_SOURCE,
-        help="Dataset ZIP or extracted root. Default: data/dataset/dataset.zip",
+        help="Dataset ZIP or extracted root. Default: data/dataset/classifier_class/dataset.zip",
     )
     args = parser.parse_args()
     root = prepare_dataset(args.data)
@@ -55,7 +58,15 @@ def main() -> int:
             raise SystemExit(
                 f"{split} contains class directories with no supported images: {empty_classes}"
             )
+    fingerprint = dataset_content_fingerprint(root, reject_cross_split_duplicates=True)
+    if int(fingerprint["image_count"]) != grand_total:
+        raise RuntimeError(
+            "Dataset scan count changed while validating: "
+            f"counted={grand_total}, fingerprinted={fingerprint['image_count']}"
+        )
     print(f"Grand total: {grand_total}")
+    print(f"Dataset SHA-256 fingerprint: {fingerprint['sha256']}")
+    print("Cross-split duplicate check: OK")
     return 0
 
 

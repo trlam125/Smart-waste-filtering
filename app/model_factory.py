@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch.nn as nn
+from PIL import Image, ImageOps
 from torchvision import models, transforms
 
 SUPPORTED_ARCHITECTURES: tuple[str, ...] = (
@@ -14,6 +15,34 @@ SUPPORTED_ARCHITECTURES: tuple[str, ...] = (
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
 TRAIN_AUGMENTATION_PROFILE = "camera_realworld_v2"
+
+
+class _PadToSquare:
+    """Center-pad a PIL image to a square without discarding object pixels.
+
+    Detector crops can be very tall or wide. Applying torchvision's usual
+    Resize(short-side) + CenterCrop directly to such crops can discard most of
+    the object. Padding first preserves the complete detector crop while keeping
+    the legacy eval transform unchanged for already-square training images.
+    """
+
+    def __init__(self, fill: tuple[int, int, int]) -> None:
+        self.fill = fill
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        width, height = image.size
+        if width <= 0 or height <= 0 or width == height:
+            return image
+        side = max(width, height)
+        pad_left = (side - width) // 2
+        pad_right = side - width - pad_left
+        pad_top = (side - height) // 2
+        pad_bottom = side - height - pad_top
+        return ImageOps.expand(
+            image,
+            border=(pad_left, pad_top, pad_right, pad_bottom),
+            fill=self.fill,
+        )
 
 
 def create_model(architecture: str, num_classes: int, *, pretrained: bool) -> nn.Module:
@@ -75,8 +104,10 @@ def build_eval_transform(
     std: Sequence[float] = IMAGENET_STD,
 ) -> transforms.Compose:
     resize_size = max(image_size, int(round(image_size * 256 / 224)))
+    fill = tuple(int(round(float(value) * 255.0)) for value in mean)
     return transforms.Compose(
         [
+            _PadToSquare(fill),
             transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BICUBIC),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
@@ -101,6 +132,7 @@ def build_train_transform(
     fill = tuple(int(round(float(value) * 255.0)) for value in mean)
     return transforms.Compose(
         [
+            _PadToSquare(fill),
             transforms.Resize(
                 resize_size,
                 interpolation=transforms.InterpolationMode.BICUBIC,

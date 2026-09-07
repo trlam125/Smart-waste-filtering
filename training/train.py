@@ -35,7 +35,11 @@ from PIL import Image
 from torchvision.datasets import ImageFolder
 
 from app.class_schema import WASTE_CLASS_KEYS  # noqa: E402
-from training.dataset_utils import DEFAULT_DATASET_SOURCE, prepare_dataset  # noqa: E402
+from training.dataset_utils import (  # noqa: E402
+    DEFAULT_DATASET_SOURCE,
+    dataset_content_fingerprint,
+    prepare_dataset,
+)
 from training.build_ood_reference import build_ood_reference  # noqa: E402
 from app.model_factory import (  # noqa: E402
     IMAGENET_MEAN,
@@ -69,7 +73,6 @@ class CanonicalImageFolder(ImageFolder):
         classes = list(WASTE_CLASS_KEYS)
         return classes, {name: index for index, name in enumerate(classes)}
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train Smart Waste Scanner on the canonical 11-class dataset."
@@ -80,7 +83,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_DATASET_SOURCE,
         help=(
             "Dataset ZIP or extracted dataset root. Default: "
-            "data/dataset/dataset.zip"
+            "data/dataset/classifier_class/dataset.zip"
         ),
     )
     parser.add_argument(
@@ -164,10 +167,8 @@ def parse_args() -> argparse.Namespace:
         args.output = training_output_dir(args.arch)
     return args
 
-
 def resolve_dataset_root(path: Path) -> Path:
     return prepare_dataset(path)
-
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -179,7 +180,6 @@ def seed_everything(seed: int) -> None:
     # between runs even when all RNGs are seeded.
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-
 
 def resolve_device(name: str) -> torch.device:
     if name == "auto":
@@ -197,11 +197,9 @@ def resolve_device(name: str) -> torch.device:
             raise RuntimeError("--device mps was requested but Apple MPS is unavailable")
     return torch.device(name)
 
-
 def class_counts(dataset: CanonicalImageFolder) -> list[int]:
     counts = Counter(int(target) for target in dataset.targets)
     return [counts.get(i, 0) for i in range(len(WASTE_CLASS_KEYS))]
-
 
 def class_weights(counts: list[int], mode: str) -> torch.Tensor | None:
     if mode == "none":
@@ -216,7 +214,6 @@ def class_weights(counts: list[int], mode: str) -> torch.Tensor | None:
         balanced = np.sqrt(balanced)
     balanced = balanced / balanced.mean()
     return torch.tensor(balanced, dtype=torch.float32)
-
 
 def build_loaders(args: argparse.Namespace, data_root: Path, device: torch.device):
     train_transform = build_train_transform(args.image_size)
@@ -261,7 +258,6 @@ def build_loaders(args: argparse.Namespace, data_root: Path, device: torch.devic
     )
     return train_ds, val_ds, test_ds, train_loader, val_loader, test_loader
 
-
 def confusion_metrics(confusion: torch.Tensor) -> dict[str, Any]:
     cm = confusion.to(torch.float64)
     tp = torch.diag(cm)
@@ -289,13 +285,11 @@ def confusion_metrics(confusion: torch.Tensor) -> dict[str, Any]:
         "per_class": per_class,
     }
 
-
 def make_grad_scaler(enabled: bool):
     try:
         return torch.amp.GradScaler("cuda", enabled=enabled)
     except TypeError:
         return torch.cuda.amp.GradScaler(enabled=enabled)
-
 
 def capture_rng_state() -> dict[str, Any]:
     numpy_state = np.random.get_state()
@@ -313,7 +307,6 @@ def capture_rng_state() -> dict[str, Any]:
     if torch.cuda.is_available():
         payload["cuda"] = [state.cpu() for state in torch.cuda.get_rng_state_all()]
     return payload
-
 
 def restore_rng_state(payload: dict[str, Any] | None) -> None:
     if not isinstance(payload, dict):
@@ -342,7 +335,6 @@ def restore_rng_state(payload: dict[str, Any] | None) -> None:
     cuda_states = payload.get("cuda")
     if torch.cuda.is_available() and isinstance(cuda_states, list) and cuda_states:
         torch.cuda.set_rng_state_all([state.cpu() for state in cuda_states if torch.is_tensor(state)])
-
 
 def run_epoch(
     model: nn.Module,
@@ -407,7 +399,6 @@ def run_epoch(
     metrics["confusion_matrix"] = confusion.tolist()
     return metrics
 
-
 def cosine_learning_rate(base_lr: float, epoch: int, total_epochs: int) -> float:
     """Cosine LR from base_lr at epoch 1 to 0 at the final configured epoch."""
     if total_epochs <= 0:
@@ -416,7 +407,6 @@ def cosine_learning_rate(base_lr: float, epoch: int, total_epochs: int) -> float
         return float(base_lr)
     progress = max(0.0, min(1.0, (max(1, epoch) - 1) / (total_epochs - 1)))
     return float(base_lr * 0.5 * (1.0 + math.cos(math.pi * progress)))
-
 
 def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
     for group in optimizer.param_groups:
@@ -439,7 +429,6 @@ def collect_logits(
     if not logits_parts:
         raise RuntimeError("Validation loader is empty; cannot calibrate temperature")
     return torch.cat(logits_parts, dim=0), torch.cat(target_parts, dim=0)
-
 
 def fit_temperature(
     logits: torch.Tensor,
@@ -489,7 +478,6 @@ def fit_temperature(
         "validation_nll_after": float(nll_after),
     }
 
-
 def deployment_metrics_from_logits(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -520,7 +508,6 @@ def deployment_metrics_from_logits(
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
-
 def resolve_challenge_dir(data_root: Path, requested: Path | None) -> Path | None:
     if requested is not None:
         candidate = requested.expanduser()
@@ -532,7 +519,6 @@ def resolve_challenge_dir(data_root: Path, requested: Path | None) -> Path | Non
 
     candidate = data_root / "challenge_realworld"
     return candidate if candidate.is_dir() else None
-
 
 def discover_challenge_samples(challenge_dir: Path) -> list[tuple[Path, int, str]]:
     samples: list[tuple[Path, int, str]] = []
@@ -630,7 +616,6 @@ def evaluate_challenge_realworld(
         "predictions": records,
     }
 
-
 def save_challenge_csv(path: Path, payload: dict[str, Any]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.writer(stream)
@@ -664,14 +649,11 @@ def save_challenge_csv(path: Path, payload: dict[str, Any]) -> None:
                 ]
             )
 
-
 def cpu_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     return {key: value.detach().cpu() for key, value in model.state_dict().items()}
 
-
 def save_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
 
 def save_confusion_csv(path: Path, confusion: list[list[int]]) -> None:
     with path.open("w", encoding="utf-8", newline="") as stream:
@@ -679,7 +661,6 @@ def save_confusion_csv(path: Path, confusion: list[list[int]]) -> None:
         writer.writerow(["actual\\predicted", *WASTE_CLASS_KEYS])
         for key, row in zip(WASTE_CLASS_KEYS, confusion):
             writer.writerow([key, *row])
-
 
 def save_history_csv(path: Path, history: list[dict[str, Any]]) -> None:
     fields = [
@@ -698,6 +679,58 @@ def save_history_csv(path: Path, history: list[dict[str, Any]]) -> None:
         writer.writerows([{key: row[key] for key in fields} for row in history])
 
 
+
+RESUME_CONFIG_VERSION = 1
+
+def build_resume_config(
+    args: argparse.Namespace,
+    dataset_fingerprint: dict[str, Any],
+) -> dict[str, Any]:
+    """Capture every setting that materially changes optimization/resume behavior."""
+    return {
+        "version": RESUME_CONFIG_VERSION,
+        "arch": str(args.arch),
+        "image_size": int(args.image_size),
+        "epochs": int(args.epochs),
+        "batch_size": int(args.batch_size),
+        "lr": float(args.lr),
+        "weight_decay": float(args.weight_decay),
+        "label_smoothing": float(args.label_smoothing),
+        "class_weighting": str(args.class_weighting),
+        "seed": int(args.seed),
+        "patience": int(args.patience),
+        "min_delta": float(args.min_delta),
+        "grad_clip": float(args.grad_clip),
+        "pretrained": bool(args.pretrained),
+        "amp": bool(args.amp),
+        "optimizer": "AdamW",
+        "lr_schedule": "cosine_absolute_epoch",
+        "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
+        "dataset": dict(dataset_fingerprint),
+    }
+
+def resume_config_differences(saved: Any, current: dict[str, Any]) -> list[str]:
+    if not isinstance(saved, dict):
+        return [
+            "checkpoint has no compatible resume_config metadata; "
+            "start a fresh run with this updated trainer"
+        ]
+
+    differences: list[str] = []
+    for key, current_value in current.items():
+        saved_value = saved.get(key)
+        if saved_value != current_value:
+            if key == "dataset":
+                differences.append("dataset fingerprint changed")
+            else:
+                differences.append(
+                    f"{key}: saved={saved_value!r}, current={current_value!r}"
+                )
+    extra_keys = sorted(set(saved) - set(current))
+    for key in extra_keys:
+        differences.append(f"unexpected saved resume setting: {key}={saved[key]!r}")
+    return differences
+
 def load_resume(
     path: Path,
     model: nn.Module,
@@ -707,6 +740,7 @@ def load_resume(
     *,
     expected_arch: str,
     expected_image_size: int,
+    expected_resume_config: dict[str, Any],
 ) -> tuple[int, float, int, list[dict[str, Any]], dict[str, Any]]:
     try:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
@@ -718,8 +752,21 @@ def load_resume(
         raise RuntimeError("Resume checkpoint architecture does not match --arch")
     if int(checkpoint.get("image_size", expected_image_size)) != expected_image_size:
         raise RuntimeError("Resume checkpoint image_size does not match --image-size")
+    differences = resume_config_differences(
+        checkpoint.get("resume_config"),
+        expected_resume_config,
+    )
+    if differences:
+        details = "\n".join(f"  - {item}" for item in differences)
+        raise RuntimeError(
+            "Refusing to resume classifier training because the dataset or training "
+            f"configuration changed:\n{details}\nStart a fresh classifier run instead."
+        )
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    expected_weight_decay = float(expected_resume_config["weight_decay"])
+    for group in optimizer.param_groups:
+        group["weight_decay"] = expected_weight_decay
     for state in optimizer.state.values():
         for key, value in state.items():
             if torch.is_tensor(value):
@@ -736,7 +783,6 @@ def load_resume(
         checkpoint,
     )
 
-
 def main() -> int:
     args = parse_args()
     if args.image_size < 96:
@@ -747,6 +793,11 @@ def main() -> int:
     seed_everything(args.seed)
     device = resolve_device(args.device)
     data_root = resolve_dataset_root(args.data)
+    dataset_fingerprint = dataset_content_fingerprint(
+        data_root,
+        reject_cross_split_duplicates=True,
+    )
+    resume_config = build_resume_config(args, dataset_fingerprint)
     output_dir = resolve_project_path(args.output)
     deploy_path = resolve_project_path(args.deploy)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -759,6 +810,11 @@ def main() -> int:
     weights = class_weights(counts, args.class_weighting)
 
     print(f"Dataset: {data_root}")
+    print(
+        "Dataset fingerprint: "
+        f"{dataset_fingerprint['sha256']} ({dataset_fingerprint['image_count']} images)"
+    )
+    print("Cross-split duplicate check: OK")
     print(f"Device: {device}")
     print(f"Architecture: {args.arch} | image_size={args.image_size}")
     print(f"Train augmentation: {TRAIN_AUGMENTATION_PROFILE}")
@@ -798,9 +854,10 @@ def main() -> int:
             device,
             expected_arch=args.arch,
             expected_image_size=args.image_size,
+            expected_resume_config=resume_config,
         )
 
-        # Restore the historical best checkpoint into a new output directory. New v4
+        # Restore the historical best checkpoint into a new output directory. New v5
         # last checkpoints are self-contained; older checkpoints fall back to the
         # sibling best_model.pt when available.
         embedded_best = resume_checkpoint.get("best_model_checkpoint")
@@ -862,11 +919,12 @@ def main() -> int:
             best_val_macro_f1 = float(val_metrics["macro_f1"])
             epochs_without_improvement = 0
             best_payload = {
-                "format_version": 4,
+                "format_version": 5,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "arch": args.arch,
                 "image_size": args.image_size,
                 "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
+                "resume_config": resume_config,
                 "class_names": list(WASTE_CLASS_KEYS),
                 "mean": list(IMAGENET_MEAN),
                 "std": list(IMAGENET_STD),
@@ -887,10 +945,11 @@ def main() -> int:
         except TypeError:
             current_best_checkpoint = torch.load(best_path, map_location="cpu")
         last_payload = {
-            "format_version": 4,
+            "format_version": 5,
             "arch": args.arch,
             "image_size": args.image_size,
             "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
+            "resume_config": resume_config,
             "class_names": list(WASTE_CLASS_KEYS),
             "epoch": epoch,
             "best_val_macro_f1": best_val_macro_f1,
@@ -927,11 +986,12 @@ def main() -> int:
         fallback_val_f1 = float(history[-1].get("val_macro_f1", -math.inf)) if history else -math.inf
         best_val_macro_f1 = fallback_val_f1
         fallback_payload = {
-            "format_version": 4,
+            "format_version": 5,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "arch": args.arch,
             "image_size": args.image_size,
             "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
+            "resume_config": resume_config,
             "class_names": list(WASTE_CLASS_KEYS),
             "mean": list(IMAGENET_MEAN),
             "std": list(IMAGENET_STD),
@@ -1001,6 +1061,8 @@ def main() -> int:
         "architecture": args.arch,
         "image_size": args.image_size,
         "train_augmentation": TRAIN_AUGMENTATION_PROFILE,
+        "dataset_fingerprint": dataset_fingerprint,
+        "resume_config": resume_config,
         "class_names": list(WASTE_CLASS_KEYS),
         "train_samples": len(train_ds),
         "val_samples": len(val_ds),

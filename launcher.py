@@ -19,7 +19,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-LAUNCHER_BUILD = "2026-08-15-status-v4-clean-vi"
+LAUNCHER_BUILD = "2026-08-15-status-v4-clean-en"
 ROOT_DIR = Path(__file__).resolve().parent
 ENV_PATH = ROOT_DIR / ".env"
 EXAMPLE_ENV_PATH = ROOT_DIR / ".env.example"
@@ -71,18 +71,18 @@ def _set_env_value(lines: list[str], key: str, value: str) -> list[str]:
 
 
 def configure_ngrok() -> int:
-    print("Cấu hình ngrok cho Waste Scanner AI")
-    print("Authtoken được lưu cục bộ trong .env; file này đã nằm trong .gitignore.")
-    token = getpass.getpass("Nhập NGROK_AUTHTOKEN: ").strip()
+    print("Configure ngrok for Waste Scanner AI")
+    print("The authtoken is stored locally in .env; this file is already listed in .gitignore.")
+    token = getpass.getpass("Enter NGROK_AUTHTOKEN: ").strip()
     if not token:
-        print("Không có token, hủy cấu hình.")
+        print("No token provided; configuration canceled.")
         return 1
 
     domain = input(
-        "NGROK_DOMAIN tùy chọn (Enter để dùng URL ngẫu nhiên miễn phí): "
+        "Optional NGROK_DOMAIN (press Enter to use a free random URL): "
     ).strip()
     basic_auth = getpass.getpass(
-        "NGROK_BASIC_AUTH tùy chọn username:password (Enter để bỏ qua): "
+        "Optional NGROK_BASIC_AUTH username:password (press Enter to skip): "
     ).strip()
 
     if ENV_PATH.exists():
@@ -96,7 +96,7 @@ def configure_ngrok() -> int:
     lines = _set_env_value(lines, "NGROK_DOMAIN", domain)
     lines = _set_env_value(lines, "NGROK_BASIC_AUTH", basic_auth)
     ENV_PATH.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-    print("Đã lưu cấu hình vào .env.")
+    print("Configuration saved to .env.")
     return 0
 
 
@@ -193,9 +193,9 @@ def _valid_port(value: str) -> int:
     try:
         port = int(value)
     except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError("Port phải là một số nguyên từ 1 đến 65535.") from exc
+        raise argparse.ArgumentTypeError("Port must be an integer from 1 to 65535.") from exc
     if not 1 <= port <= 65535:
-        raise argparse.ArgumentTypeError("Port phải nằm trong khoảng 1..65535.")
+        raise argparse.ArgumentTypeError("Port must be in the range 1..65535.")
     return port
 
 
@@ -237,8 +237,8 @@ def _port_owner_message(port: int) -> str:
     pids = _listener_pids(port)
     if pids:
         joined = ", ".join(str(pid) for pid in pids)
-        return f"Port {port} đang bị tiến trình PID {joined} chiếm."
-    return f"Port {port} chưa bind được, nhưng không xác định được PID listener."
+        return f"Port {port} is occupied by process PID {joined}."
+    return f"Port {port} could not be bound, but the listener PID could not be identified."
 
 
 def require_free_port(port: int) -> None:
@@ -246,16 +246,16 @@ def require_free_port(port: int) -> None:
         return
     message = _port_owner_message(port)
     if os.name == "nt":
-        message += f" Chạy 'start.bat clean' hoặc dùng --replace-port để đóng instance cũ."
+        message += f" Run 'start.bat clean' or use --replace-port to stop the previous instance."
     else:
-        message += " Dùng --replace-port để đóng instance cũ và khởi động lại."
+        message += " Use --replace-port to stop the previous instance and restart."
     raise RuntimeError(message)
 
 
 def kill_port_listener(port: int) -> int:
     """Kill processes listening on *port* on Windows, Linux/Colab, or macOS."""
     if _port_is_free(port):
-        print(f"Port {port} đang trống, không cần dọn.")
+        print(f"Port {port} is free; no cleanup is needed.")
         return 0
 
     pids = _listener_pids(port)
@@ -274,12 +274,12 @@ def kill_port_listener(port: int) -> int:
             except (OSError, subprocess.TimeoutExpired):
                 pass
             if _wait_port_free(port, timeout_seconds=3.0):
-                print(f"Đã giải phóng port {port}.")
+                print(f"Released port {port}.")
                 return 0
         print(_port_owner_message(port), file=sys.stderr)
         return 1
 
-    print(f"Tìm thấy listener trên port {port}: PID {', '.join(map(str, pids))}")
+    print(f"Found a listener on port {port}: PID {', '.join(map(str, pids))}")
 
     if os.name == "nt":
         for pid in pids:
@@ -290,11 +290,11 @@ def kill_port_listener(port: int) -> int:
                 check=False,
             )
             if result.returncode != 0:
-                print(f"Không đóng được PID {pid}.", file=sys.stderr)
+                print(f"Could not terminate PID {pid}.", file=sys.stderr)
         if not _wait_port_free(port):
-            print(f"Không thể giải phóng port {port}.", file=sys.stderr)
+            print(f"Could not release port {port}.", file=sys.stderr)
             return 1
-        print(f"Đã giải phóng port {port}.")
+        print(f"Released port {port}.")
         return 0
 
     # POSIX: terminate politely first so Uvicorn/ngrok related cleanup can run.
@@ -305,10 +305,10 @@ def kill_port_listener(port: int) -> int:
         except ProcessLookupError:
             pass
         except PermissionError:
-            print(f"Không có quyền dừng PID {pid}.", file=sys.stderr)
+            print(f"Permission denied while stopping PID {pid}.", file=sys.stderr)
 
     if _wait_port_free(port, timeout_seconds=3.0):
-        print(f"Đã giải phóng port {port}.")
+        print(f"Released port {port}.")
         return 0
 
     remaining = _listener_pids(port)
@@ -319,13 +319,13 @@ def kill_port_listener(port: int) -> int:
         except ProcessLookupError:
             pass
         except PermissionError:
-            print(f"Không có quyền kill PID {pid}.", file=sys.stderr)
+            print(f"Permission denied while killing PID {pid}.", file=sys.stderr)
 
     if not _wait_port_free(port, timeout_seconds=3.0):
-        print(f"Không thể giải phóng port {port}.", file=sys.stderr)
+        print(f"Could not release port {port}.", file=sys.stderr)
         return 1
 
-    print(f"Đã giải phóng port {port}.")
+    print(f"Released port {port}.")
     return 0
 
 
@@ -334,9 +334,9 @@ def prepare_port(port: int, *, replace_existing: bool) -> None:
         return
     if not replace_existing:
         require_free_port(port)
-    _log(f"Port {port} đang được sử dụng; đang đóng instance cũ...")
+    _log(f"Port {port} is in use; stopping the previous instance...")
     if kill_port_listener(port) != 0:
-        raise RuntimeError(f"Không thể giải phóng port {port}.")
+        raise RuntimeError(f"Could not release port {port}.")
 
 
 def start_server(port: int, reload_enabled: bool, launch_token: str) -> subprocess.Popen[bytes]:
@@ -359,7 +359,7 @@ def start_server(port: int, reload_enabled: bool, launch_token: str) -> subproce
     child_env["PYTHONUNBUFFERED"] = "1"
     child_env["WASTE_SCANNER_LAUNCH_TOKEN"] = launch_token
     process = subprocess.Popen(command, cwd=ROOT_DIR, env=child_env, **_popen_kwargs())
-    _log(f"Đã tạo tiến trình Uvicorn (PID={process.pid}, port={port}).")
+    _log(f"Created Uvicorn process (PID={process.pid}, port={port}).")
     return process
 
 
@@ -402,7 +402,7 @@ def _decode_health_response(response) -> dict[str, object]:
     raw = response.read().decode("utf-8")
     payload = json.loads(raw)
     if not isinstance(payload, dict):
-        raise ValueError("Health endpoint không trả về JSON object.")
+        raise ValueError("Health endpoint did not return a JSON object.")
     return payload
 
 
@@ -424,16 +424,16 @@ def wait_for_server(
     http_seen = False
     waiting_fastapi_logged = False
 
-    target = "mô hình AI" if require_ready else "FastAPI"
-    _log(f"Đang đợi {target} sẵn sàng...")
+    target = "AI model" if require_ready else "FastAPI"
+    _log(f"Waiting for {target} to become ready...")
 
     while time.monotonic() < deadline:
         if process is not None:
             return_code = process.poll()
             if return_code is not None:
                 raise RuntimeError(
-                    "FastAPI đã dừng trước khi sẵn sàng "
-                    f"(exit code {return_code}). Xem log Uvicorn phía trên để biết chi tiết."
+                    "FastAPI exited before becoming ready "
+                    f"(exit code {return_code}). See the Uvicorn log above for details."
                 )
 
         payload: dict[str, object] | None = None
@@ -463,18 +463,18 @@ def wait_for_server(
         if payload is not None:
             if not http_seen:
                 http_seen = True
-                _log(f"FastAPI đã phản hồi tại http://127.0.0.1:{port}.")
+                _log(f"FastAPI responded at http://127.0.0.1:{port}.")
 
             if payload.get("app") != "waste-scanner-ai":
-                last_error = "Port đang trả về một server khác, không phải Waste Scanner AI."
+                last_error = "The port is serving another server, not Waste Scanner AI."
             else:
                 actual_token = str(payload.get("launch_token", ""))
                 token_matches = expected_token is None or actual_token == expected_token
                 if not token_matches:
                     if actual_token:
-                        last_error = "Port đang trả về một instance Waste Scanner khác."
+                        last_error = "The port is serving another Waste Scanner instance."
                     else:
-                        last_error = "Port đang trả về một server cũ/khác không có launch token."
+                        last_error = "The port is serving an older or different server without a launch token."
                 else:
                     classifier = payload.get("classifier")
                     classifier_dict = classifier if isinstance(classifier, dict) else {}
@@ -484,11 +484,11 @@ def wait_for_server(
                     if classifier_state != last_state:
                         last_state = classifier_state
                         if classifier_state == "not_loaded":
-                            _log("FastAPI đã online; đang chờ tác vụ nạp AI bắt đầu...")
+                            _log("FastAPI is online; waiting for AI loading to begin...")
                         elif classifier_state == "loading":
                             checkpoint = classifier_dict.get("checkpoint")
                             ood_ref = classifier_dict.get("ood_reference")
-                            _log("AI đang nạp checkpoint/OOD reference...")
+                            _log("AI is loading the checkpoint/OOD reference...")
                             if checkpoint:
                                 _log(f"Checkpoint: {checkpoint}")
                             if ood_ref:
@@ -502,37 +502,37 @@ def wait_for_server(
                             )
                         elif classifier_state in {"error", "retry_available"}:
                             detail = f": {classifier_error}" if classifier_error else ""
-                            _log(f"AI nạp lỗi ({classifier_state}){detail}", prefix="ERROR")
+                            _log(f"AI loading failed ({classifier_state}){detail}", prefix="ERROR")
 
                     if require_ready and not bool(payload.get("ready")):
                         if classifier_state in {"error", "retry_available"}:
                             detail = f": {classifier_error}" if classifier_error else ""
-                            raise RuntimeError(f"Mô hình AI không sẵn sàng{detail}")
-                        last_error = f"Mô hình AI đang khởi động (state={classifier_state or 'unknown'})."
+                            raise RuntimeError(f"AI model is not ready{detail}")
+                        last_error = f"AI model is starting (state={classifier_state or 'unknown'})."
 
                         # Keep Colab visibly alive during long Drive/OOD work.
                         if now - last_progress_log >= 10.0:
                             remaining = max(0, int(deadline - now))
                             _log(
-                                f"Vẫn đang khởi động AI... {elapsed:.0f}s đã trôi qua, "
-                                f"còn tối đa {remaining}s."
+                                f"AI is still starting... {elapsed:.0f}s elapsed, "
+                                f"up to {remaining}s."
                             )
                             last_progress_log = now
                     else:
                         return payload
 
         elif not waiting_fastapi_logged:
-            _log("Đang chờ FastAPI phản hồi...")
+            _log("Waiting for FastAPI to respond...")
             waiting_fastapi_logged = True
 
         time.sleep(0.5)
 
     detail = f" ({last_error})" if last_error else ""
     if require_ready:
-        raise RuntimeError(f"Mô hình AI không sẵn sàng tại {url}{detail}.")
+        raise RuntimeError(f"AI model is not ready at {url}{detail}.")
     if expected_token is None:
-        raise RuntimeError(f"Không tìm thấy Waste Scanner AI đang chạy tại {url}{detail}.")
-    raise RuntimeError(f"FastAPI mới không sẵn sàng tại {url}{detail}.")
+        raise RuntimeError(f"No running Waste Scanner AI instance was found at {url}{detail}.")
+    raise RuntimeError(f"The new FastAPI instance is not ready at {url}{detail}.")
 
 
 def build_tunnel(port: int):
@@ -540,14 +540,14 @@ def build_tunnel(port: int):
         from pyngrok import conf, ngrok
     except ImportError as exc:
         raise RuntimeError(
-            "Thiếu pyngrok. Hãy cài dependencies trước."
+            "pyngrok is missing. Install dependencies first."
         ) from exc
 
     token = os.getenv("NGROK_AUTHTOKEN", "").strip()
     if not token:
         raise RuntimeError(
-            "Chưa có NGROK_AUTHTOKEN. Chạy 'python launcher.py --configure' "
-            "hoặc thêm NGROK_AUTHTOKEN vào file .env."
+            "NGROK_AUTHTOKEN is not configured. Run 'python launcher.py --configure' "
+            "or add NGROK_AUTHTOKEN to the .env file."
         )
 
     config = conf.PyngrokConfig(auth_token=token)
@@ -570,56 +570,56 @@ def build_tunnel(port: int):
                 **options,
             )
     except Exception as exc:
-        raise RuntimeError(f"Không thể tạo ngrok tunnel: {exc}") from exc
+        raise RuntimeError(f"Failed to create ngrok tunnel: {exc}") from exc
     return ngrok, tunnel
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Launcher duy nhất cho Waste Scanner AI: local, dev và ngrok."
+        description="Single launcher for Waste Scanner AI: local, development, and ngrok."
     )
     parser.add_argument(
         "--configure",
         action="store_true",
-        help="Nhập và lưu cấu hình ngrok vào .env, sau đó thoát.",
+        help="Enter and save ngrok configuration to .env, then exit.",
     )
     parser.add_argument(
         "--ngrok",
         action="store_true",
-        help="Chạy FastAPI và công khai qua ngrok HTTPS.",
+        help="Run FastAPI and expose it through ngrok HTTPS.",
     )
     parser.add_argument(
         "--port",
         type=_valid_port,
         default=os.getenv("PORT", "8000"),
-        help="Cổng FastAPI nội bộ, 1..65535 (mặc định: PORT trong .env hoặc 8000).",
+        help="Internal FastAPI port, 1..65535 (default: PORT in .env or 8000).",
     )
     parser.add_argument(
         "--reload",
         action="store_true",
-        help="Bật auto-reload Uvicorn khi phát triển.",
+        help="Enable Uvicorn auto-reload during development.",
     )
     parser.add_argument(
         "--no-server",
         action="store_true",
-        help="Với --ngrok: chỉ tạo tunnel khi FastAPI đã chạy sẵn.",
+        help="With --ngrok: create a tunnel only when FastAPI is already running.",
     )
     parser.add_argument(
         "--open",
         action="store_true",
-        help="Với --ngrok: tự động mở URL public trên trình duyệt máy chủ.",
+        help="With --ngrok: automatically open the public URL in the host browser.",
     )
     parser.add_argument(
         "--kill-port",
         action="store_true",
-        help="Đóng tiến trình đang LISTEN trên --port (Windows/Linux/macOS) và thoát.",
+        help="Stop the process LISTENING on --port (Windows/Linux/macOS) and exit.",
     )
     parser.add_argument(
         "--replace-port",
         action="store_true",
         help=(
-            "Nếu --port đang có listener, đóng instance cũ rồi khởi động server mới. "
-            "Hữu ích khi restart trên Colab/local dev."
+            "If --port already has a listener, stop the previous instance and start a new server. "
+            "Useful when restarting on Colab or during local development."
         ),
     )
     parser.add_argument(
@@ -627,13 +627,13 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=_startup_timeout_default(),
         help=(
-            "Số giây tối đa đợi mô hình AI sẵn sàng. "
-            "Mặc định 600s trên Colab, 180s ở local, hoặc STARTUP_TIMEOUT_SECONDS trong .env."
+            "Maximum number of seconds to wait for the AI model to become ready. "
+            "Defaults to 600s on Colab, 180s locally, or STARTUP_TIMEOUT_SECONDS from .env."
         ),
     )
     args = parser.parse_args()
     if args.startup_timeout < 30:
-        parser.error("--startup-timeout phải >= 30 giây.")
+        parser.error("--startup-timeout must be >= 30 seconds.")
     return args
 
 
@@ -651,23 +651,23 @@ def run_local(port: int, reload_enabled: bool, replace_port: bool) -> int:
         prepare_port(port, replace_existing=replace_port)
         launch_token = uuid.uuid4().hex
         mode = "development/reload" if reload_enabled else "normal"
-        print(f"[Waste Scanner] Chế độ: {mode}")
+        print(f"[Waste Scanner] Mode: {mode}")
         print(f"[Waste Scanner] http://127.0.0.1:{port}")
-        print("Nhấn Ctrl+C một lần để dừng toàn bộ server.")
+        print("Press Ctrl+C once to stop the entire server.")
         server = start_server(port, reload_enabled, launch_token)
         wait_for_server(port, launch_token, process=server)
         while server.poll() is None:
             time.sleep(0.5)
         return int(server.returncode or 0)
     except RuntimeError as exc:
-        print(f"\nLỖI: {exc}", file=sys.stderr)
+        print(f"\nERROR: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("\nĐang dừng toàn bộ Waste Scanner AI...")
+        print("\nStopping all Waste Scanner AI processes...")
         return 0
     finally:
         stop_process_tree(server)
-        print("Đã đóng server và các tiến trình con.")
+        print("Server and child processes stopped.")
 
 
 def run_ngrok(
@@ -693,7 +693,7 @@ def run_ngrok(
         if not no_server:
             prepare_port(port, replace_existing=replace_port)
             launch_token = uuid.uuid4().hex
-            _log(f"Khởi động FastAPI tại http://127.0.0.1:{port}")
+            _log(f"Starting FastAPI at http://127.0.0.1:{port}")
             server = start_server(port, reload_enabled, launch_token)
             wait_for_server(
                 port,
@@ -703,7 +703,7 @@ def run_ngrok(
                 require_ready=True,
             )
         else:
-            _log(f"Kiểm tra server có sẵn tại http://127.0.0.1:{port}")
+            _log(f"Checking for an existing server at http://127.0.0.1:{port}")
             wait_for_server(
                 port,
                 expected_token=None,
@@ -711,17 +711,17 @@ def run_ngrok(
                 require_ready=True,
             )
 
-        _log("AI sẵn sàng. Đang tạo HTTPS tunnel...", prefix="ngrok")
+        _log("AI is ready. Creating HTTPS tunnel...", prefix="ngrok")
         ngrok_client, tunnel = build_tunnel(port)
         public_url = tunnel.public_url
 
         print("\n" + "=" * 72, flush=True)
-        print("WASTE SCANNER AI ĐÃ ONLINE", flush=True)
+        print("WASTE SCANNER AI IS ONLINE", flush=True)
         print(f"PUBLIC URL : {public_url}", flush=True)
         print(f"LOCAL URL  : http://127.0.0.1:{port}", flush=True)
         print("INSPECTOR  : http://127.0.0.1:4040", flush=True)
         print("STATUS     : FastAPI + AI model + ngrok READY", flush=True)
-        print("Nhấn Stop cell / Ctrl+C để dừng server và tunnel.", flush=True)
+        print("Press Stop cell / Ctrl+C to stop the server and tunnel.", flush=True)
         print("=" * 72 + "\n", flush=True)
 
         if open_browser:
@@ -735,10 +735,10 @@ def run_ngrok(
         while True:
             time.sleep(60)
     except KeyboardInterrupt:
-        print("\nĐang dừng Waste Scanner AI và ngrok...")
+        print("\nStopping Waste Scanner AI and ngrok...")
         return 0
     except RuntimeError as exc:
-        print(f"\nLỖI: {exc}", file=sys.stderr)
+        print(f"\nERROR: {exc}", file=sys.stderr)
         return 1
     finally:
         if tunnel is not None:
@@ -768,10 +768,10 @@ def main() -> int:
     print(f"Project    : {ROOT_DIR}", flush=True)
     print(f"Colab      : {_running_in_colab()}", flush=True)
     print("=" * 72, flush=True)
-    _log("Launcher đã bắt đầu. Đang đọc tham số khởi động...")
+    _log("Launcher started. Reading startup arguments...")
     args = parse_args()
     _log(
-        f"Tham số: ngrok={args.ngrok}, port={args.port}, reload={args.reload}, "
+        f"Arguments: ngrok={args.ngrok}, port={args.port}, reload={args.reload}, "
         f"replace_port={args.replace_port}, timeout={args.startup_timeout}s"
     )
     if args.kill_port:
@@ -788,7 +788,7 @@ def main() -> int:
             args.replace_port,
         )
     if args.no_server or args.open:
-        print("--no-server và --open chỉ dùng kèm --ngrok.", file=sys.stderr)
+        print("--no-server and --open can only be used with --ngrok.", file=sys.stderr)
         return 2
     return run_local(args.port, args.reload, args.replace_port)
 

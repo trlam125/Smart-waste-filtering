@@ -18,7 +18,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.class_schema import WASTE_CLASS_KEYS  # noqa: E402
 from app.model_factory import build_eval_transform, create_model, get_final_classifier_layer  # noqa: E402
 from app.paths import ood_reference_path, resolve_project_path  # noqa: E402
-from training.dataset_utils import DEFAULT_DATASET_SOURCE, prepare_dataset  # noqa: E402
+from training.dataset_utils import (  # noqa: E402
+    DEFAULT_DATASET_SOURCE,
+    IMAGE_EXTENSIONS,
+    prepare_dataset,
+)
 
 
 def _project_path(value: Path | str) -> Path:
@@ -57,8 +61,8 @@ def _image_paths(root: Path, split: str, class_name: str) -> list[Path]:
         raise FileNotFoundError(f"Missing dataset class directory: {directory}")
     return sorted(
         path
-        for path in directory.iterdir()
-        if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}
+        for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
     )
 
 

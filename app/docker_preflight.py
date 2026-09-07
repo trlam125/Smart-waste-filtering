@@ -43,8 +43,18 @@ def validate_deploy_assets() -> None:
             "Mount/copy models/best_model.pt before starting the container."
         )
 
+    detector_checkpoint = _path_from_env(
+        "WASTE_DETECTOR_CHECKPOINT", "/app/models/best_detector.pt"
+    )
+    if not detector_checkpoint.is_file():
+        raise RuntimeError(
+            f"Missing detector checkpoint: {detector_checkpoint}. "
+            "Mount/copy models/best_detector.pt before starting the container."
+        )
+
     if not _bool_env("OOD_DETECTION_ENABLED", True):
-        print(f"[docker-preflight] checkpoint OK: {checkpoint_path}")
+        print(f"[docker-preflight] classifier checkpoint OK: {checkpoint_path}")
+        print(f"[docker-preflight] detector checkpoint OK: {detector_checkpoint}")
         print("[docker-preflight] OOD detection disabled; skipping OOD reference validation.")
         return
 
@@ -84,7 +94,8 @@ def validate_deploy_assets() -> None:
             f"Expected {WASTE_CLASS_KEYS}, got {stored_classes}."
         )
 
-    print(f"[docker-preflight] checkpoint OK: {checkpoint_path}")
+    print(f"[docker-preflight] classifier checkpoint OK: {checkpoint_path}")
+    print(f"[docker-preflight] detector checkpoint OK: {detector_checkpoint}")
     print(f"[docker-preflight] OOD reference OK and hash-matched: {ood_path}")
 
 

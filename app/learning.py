@@ -238,7 +238,12 @@ def apply_feedback_memory(
     certainty_agreement_count = certainty_count_by_key.get(memory_key, 0)
     certainty_agreement_ratio = certainty_agreement_count / max(1, len(certainty_neighbors))
 
-    best_similarity = neighbors[0][0]
+    winning_similarities = [
+        similarity
+        for similarity, example in neighbors
+        if str(example.get("corrected_key", "")) == memory_key
+    ]
+    best_similarity = max(winning_similarities, default=LEARNING_MIN_SIMILARITY)
     proximity = max(
         0.0,
         min(

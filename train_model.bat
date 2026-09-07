@@ -3,18 +3,18 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "DATASET=%~1"
-if not defined DATASET set "DATASET=%CD%\data\dataset\dataset.zip"
+if not defined DATASET set "DATASET=%CD%\data\dataset\classifier_class\dataset.zip"
 
 set "OUTPUT=%CD%\runs\efficientnet_b0"
 set "CHECKPOINT=%OUTPUT%\last_checkpoint.pt"
 
 if not exist "%DATASET%" (
   echo.
-  echo [ERROR] Dataset not found:
+  echo [ERROR] Classifier dataset not found:
   echo   %DATASET%
   echo.
-  echo Put your dataset here:
-  echo   %CD%\data\dataset\dataset.zip
+  echo Put your classifier ZIP here:
+  echo   %CD%\data\dataset\classifier_class\dataset.zip
   echo.
   echo Then run train_model.bat again.
   exit /b 1
@@ -32,9 +32,13 @@ python -m pip install -r requirements.txt
 if errorlevel 1 exit /b 1
 
 echo.
-echo === Checking dataset ===
+echo === Checking classifier dataset ===
 python training\inspect_dataset.py --data "%DATASET%"
-if errorlevel 1 exit /b 1
+if errorlevel 1 (
+  echo.
+  echo Dataset check failed. The extracted cache was removed automatically if extraction failed.
+  exit /b 1
+)
 
 echo.
 if exist "%CHECKPOINT%" (
@@ -55,6 +59,7 @@ if exist "%CHECKPOINT%" (
 if errorlevel 1 (
   echo.
   echo Training stopped or failed.
+  echo The extracted classifier dataset is being KEPT so you can resume without extracting again.
   if exist "%CHECKPOINT%" (
     echo Resume checkpoint kept at:
     echo   %CHECKPOINT%
@@ -73,5 +78,11 @@ if exist "%CHECKPOINT%" (
   echo Resume checkpoint removed because training completed successfully.
 )
 
-echo Best model: %CD%\models\best_model.pt
+echo.
+echo === Cleaning extracted classifier dataset ===
+python -c "import shutil; from training.dataset_utils import DEFAULT_EXTRACT_DIR; print('Removing:', DEFAULT_EXTRACT_DIR); shutil.rmtree(DEFAULT_EXTRACT_DIR, ignore_errors=True)"
+if errorlevel 1 echo [WARN] Could not clean the temporary classifier dataset automatically.
+
+echo.
+echo Best classifier model: %CD%\models\best_model.pt
 endlocal

@@ -1,6 +1,10 @@
 const video = document.getElementById('camera');
+const cameraShell = document.querySelector('.camera-shell');
 const canvas = document.getElementById('canvas');
 const preview = document.getElementById('preview');
+const detectionOverlay = document.getElementById('detectionOverlay');
+const objectResults = document.getElementById('objectResults');
+const objectSummary = document.getElementById('objectSummary');
 const cameraMessage = document.getElementById('cameraMessage');
 const captureButton = document.getElementById('capture');
 const switchCameraButton = document.getElementById('switchCamera');
@@ -10,6 +14,7 @@ const scanAgainButton = document.getElementById('scanAgain');
 const loading = document.getElementById('loading');
 const laserBeam = document.getElementById('laserBeam');
 const resultSection = document.getElementById('resultSection');
+const resultCard = document.getElementById('resultCard');
 const historyDrawer = document.getElementById('historyDrawer');
 const historyList = document.getElementById('historyList');
 const historySearch = document.getElementById('historySearch');
@@ -64,6 +69,9 @@ let historySearchTimer = null;
 let filePickerOpening = false;
 let cameraRestartTimer = null;
 let currentResult = null;
+let currentResponse = null;
+let currentObjects = [];
+let activeObjectIndex = 0;
 let catalogItems = [];
 let feedbackSubmitting = false;
 let historyEditItem = null;
@@ -78,6 +86,51 @@ const JPEG_QUALITY = 0.82;
 const COLLECTION_MAX_DIMENSION = 1600;
 const COLLECTION_JPEG_QUALITY = 0.92;
 const COLLECTION_DIRECT_MAX_BYTES = 12 * 1024 * 1024;
+
+function detectPhoneDevice() {
+  if (typeof navigator.userAgentData?.mobile === 'boolean') {
+    return navigator.userAgentData.mobile;
+  }
+  const userAgent = navigator.userAgent || '';
+  return /iPhone|iPod|Windows Phone|IEMobile|Opera Mini|Android.*Mobile/i.test(userAgent);
+}
+
+const PHONE_CAMERA_MODE = detectPhoneDevice();
+document.documentElement.classList.toggle('phone-camera-mode', PHONE_CAMERA_MODE);
+let preferredWideRearDeviceId = null;
+
+function syncPhoneCameraAspect(width, height) {
+  if (!PHONE_CAMERA_MODE || !cameraShell) return;
+  const mediaWidth = Number(width);
+  const mediaHeight = Number(height);
+  if (!Number.isFinite(mediaWidth) || !Number.isFinite(mediaHeight) || mediaWidth <= 0 || mediaHeight <= 0) return;
+
+  // Match the shell to the actual mobile camera/photo aspect ratio. This keeps
+  // object-fit: contain without the large black side bars seen with portrait
+  // camera streams inside the old fixed 4:3 shell.
+  cameraShell.style.setProperty('--phone-camera-aspect', `${mediaWidth} / ${mediaHeight}`);
+}
+
+function syncPhoneVideoAspect() {
+  syncPhoneCameraAspect(video.videoWidth, video.videoHeight);
+}
+
+function visibleObjectName(item, fallback = 'Object') {
+  if (!item) return fallback;
+  return item.display_name || fallback;
+}
+
+if (video) {
+  video.addEventListener('loadedmetadata', syncPhoneVideoAspect);
+  video.addEventListener('resize', syncPhoneVideoAspect);
+}
+
+if (preview) {
+  preview.addEventListener('load', () => {
+    syncPhoneCameraAspect(preview.naturalWidth, preview.naturalHeight);
+    renderDetectionOverlay();
+  });
+}
 
 const CLIENT_ID_STORAGE_KEY = 'waste-scanner-client-id';
 const CLIENT_ID_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
@@ -95,7 +148,7 @@ function safeStorageGet(key) {
   try {
     return localStorage.getItem(key);
   } catch (error) {
-    console.warn(`Không thể đọc localStorage (${key}):`, error);
+    console.warn(`Could not read localStorage (${key}):`, error);
     return null;
   }
 }
@@ -105,7 +158,7 @@ function safeStorageSet(key, value) {
     localStorage.setItem(key, value);
     return true;
   } catch (error) {
-    console.warn(`Không thể ghi localStorage (${key}):`, error);
+    console.warn(`Could not write localStorage (${key}):`, error);
     return false;
   }
 }
@@ -119,7 +172,7 @@ function safeCookieGet(name) {
       .find(item => item.startsWith(prefix));
     return entry ? decodeURIComponent(entry.slice(prefix.length)) : null;
   } catch (error) {
-    console.warn(`Không thể đọc cookie (${name}):`, error);
+    console.warn(`Could not read cookie (${name}):`, error);
     return null;
   }
 }
@@ -130,7 +183,7 @@ function safeCookieSet(name, value) {
     document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}; Path=/; Max-Age=${CLIENT_ID_COOKIE_MAX_AGE}; SameSite=Lax${secure}`;
     return safeCookieGet(name) === value;
   } catch (error) {
-    console.warn(`Không thể ghi cookie (${name}):`, error);
+    console.warn(`Could not write cookie (${name}):`, error);
     return false;
   }
 }
@@ -255,7 +308,23 @@ function showPreview(blob) {
 
 function clearResult() {
   currentResult = null;
+  currentResponse = null;
+  currentObjects = [];
+  activeObjectIndex = 0;
   resultSection.hidden = true;
+  if (objectResults) {
+    objectResults.replaceChildren();
+    objectResults.hidden = true;
+  }
+  if (objectSummary) {
+    objectSummary.textContent = '';
+    objectSummary.hidden = true;
+  }
+  if (detectionOverlay) {
+    detectionOverlay.replaceChildren();
+    detectionOverlay.hidden = true;
+  }
+  if (resultCard) resultCard.hidden = false;
   if (feedbackCorrection) feedbackCorrection.hidden = true;
   if (feedbackStatus) feedbackStatus.textContent = '';
   if (learningMemoryBadge) learningMemoryBadge.hidden = true;
@@ -275,26 +344,43 @@ async function refreshHealth() {
     const response = await fetch('/api/health', { cache: 'no-store' });
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
-    const state = payload.classifier?.state || (response.ok ? 'not_loaded' : 'error');
 
-    if (state === 'ready') {
-      renderHealthStatus('ready', 'AI sẵn sàng', `Mô hình: ${payload.classifier?.architecture || payload.classifier?.model_type || 'đã nạp'}`);
-    } else if (state === 'loading') {
-      renderHealthStatus('checking', 'AI đang tải', 'Mô hình AI đang được nạp nền để lần quét đầu nhanh hơn.');
-    } else if (state === 'not_loaded') {
-      renderHealthStatus('not_loaded', 'AI chưa tải', 'Mô hình sẽ được tải khi bạn phân loại ảnh lần đầu.');
-    } else if (state === 'retry_available') {
-      renderHealthStatus('not_loaded', 'AI có thể thử lại', 'Thời gian chờ sau lỗi đã hết; lần quét tiếp theo sẽ thử nạp mô hình lại.');
+    const classifierState = payload.classifier?.state || 'not_loaded';
+    const detectorState = payload.detector?.state || 'not_loaded';
+    const states = [detectorState, classifierState];
+
+    if (payload.ready === true) {
+      const classifierName = payload.classifier?.architecture || 'classifier';
+      renderHealthStatus(
+        'ready',
+        'Multi-object AI ready',
+        `YOLO detector + ${classifierName} loaded. You can scan multiple objects in a single image.`
+      );
+    } else if (states.includes('loading')) {
+      renderHealthStatus('checking', 'AI is loading', 'The detector and classifier are loading in the background.');
+    } else if (states.every(state => state === 'not_loaded')) {
+      renderHealthStatus('not_loaded', 'AI not loaded', 'Both models will load when the app starts or on the first scan.');
+    } else if (states.includes('retry_available')) {
+      renderHealthStatus('not_loaded', 'AI can retry', 'A model retry cooldown has expired after an error; the next scan will try loading it again.');
     } else {
-      const retryIn = Number(payload.classifier?.retry_in_seconds || 0);
-      const retryHint = retryIn > 0 ? ` Có thể thử lại sau khoảng ${Math.ceil(retryIn)} giây.` : '';
-      renderHealthStatus('error', 'AI lỗi', `${payload.classifier?.error || 'Mô hình AI hiện không khả dụng.'}${retryHint}`);
+      const errors = [payload.detector?.error, payload.classifier?.error].filter(Boolean);
+      const retryIn = Math.max(
+        Number(payload.detector?.retry_in_seconds || 0),
+        Number(payload.classifier?.retry_in_seconds || 0)
+      );
+      const retryHint = retryIn > 0 ? ` Retry in about ${Math.ceil(retryIn)} seconds.` : '';
+      renderHealthStatus(
+        'error',
+        'AI error',
+        `${errors.join(' | ') || 'The detector or classifier is currently unavailable.'}${retryHint}`
+      );
     }
   } catch (error) {
-    console.error('Lỗi kiểm tra trạng thái AI:', error);
-    renderHealthStatus('offline', 'Mất kết nối', 'Không thể kết nối đến máy chủ.');
+    console.error('Error checking AI status:', error);
+    renderHealthStatus('offline', 'Disconnected', 'Could not connect to the server.');
   }
 }
+
 
 // --- Camera Logic ---
 function stopStreamTracks(targetStream) {
@@ -305,15 +391,146 @@ function cameraErrorMessage(error) {
   switch (error?.name) {
     case 'NotAllowedError':
     case 'SecurityError':
-      return 'Camera bị chặn. Hãy cấp quyền camera cho trang này hoặc tải ảnh lên.';
+      return 'Camera access is blocked. Allow camera permission for this site or upload an image.';
     case 'NotFoundError':
-      return 'Không tìm thấy camera phù hợp. Bạn vẫn có thể tải ảnh từ thiết bị.';
+      return 'No suitable camera was found. You can still upload an image from your device.';
     case 'NotReadableError':
-      return 'Camera đang được ứng dụng khác sử dụng hoặc chưa sẵn sàng. Hãy thử lại hoặc tải ảnh lên.';
+      return 'The camera is in use by another app or is not ready. Try again or upload an image.';
     case 'OverconstrainedError':
-      return 'Camera không hỗ trợ cấu hình yêu cầu. Hãy thử đổi camera hoặc tải ảnh lên.';
+      return 'The camera does not support the requested configuration. Try switching cameras or upload an image.';
     default:
-      return 'Không thể kết nối camera. Vui lòng cấp quyền hoặc tải ảnh lên.';
+      return 'Could not access the camera. Please grant permission or upload an image.';
+  }
+}
+
+function looksLikeFrontCamera(label) {
+  // Keep legacy localized camera-label aliases via escapes without localizing the UI.
+  return /front|selfie|user|\u0074\u0072\u01b0\u1edbc|\u0074\u0072\u0075\u006f\u0063/i.test(label || '');
+}
+
+function looksLikeUltraWideCamera(label) {
+  // Keep legacy localized ultra-wide aliases for devices that expose translated lens labels.
+  return /ultra[\s-]*wide|ultrawide|0[.,]5\s*x|wide[\s-]*angle|\bwide\b|\u0067\u00f3\u0063\u0020\u0072\u1ed9\u006e\u0067|\u0067\u006f\u0063\u0020\u0072\u006f\u006e\u0067/i.test(label || '');
+}
+
+async function applyAccuracySafePhoneZoom(targetStream) {
+  if (!PHONE_CAMERA_MODE || facingMode !== 'environment') return;
+  const track = targetStream?.getVideoTracks?.()[0];
+  if (!track?.getCapabilities || !track?.applyConstraints) return;
+  try {
+    const capabilities = track.getCapabilities();
+    const zoom = capabilities?.zoom;
+    const minZoom = Number(zoom?.min);
+    const maxZoom = Number(zoom?.max);
+    if (Number.isFinite(minZoom) && Number.isFinite(maxZoom)) {
+      // On phones, prefer the widest optical/logical rear-camera view exposed
+      // by the browser. Desktop/laptop behavior is unchanged by PHONE_CAMERA_MODE.
+      const wideZoom = minZoom;
+      await track.applyConstraints({ advanced: [{ zoom: wideZoom }] });
+    }
+  } catch (error) {
+    console.debug('Could not set ultra-wide zoom for the mobile camera:', error);
+  }
+}
+
+async function openExactCameraDevice(deviceId) {
+  return navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: {
+      deviceId: { exact: deviceId },
+      width: { ideal: CAMERA_TARGET_WIDTH },
+      height: { ideal: CAMERA_TARGET_HEIGHT },
+      frameRate: { ideal: 24, max: 30 }
+    }
+  });
+}
+
+async function preferPhoneWideRearCamera(baseStream) {
+  if (!PHONE_CAMERA_MODE || facingMode !== 'environment' || !navigator.mediaDevices?.enumerateDevices) {
+    return baseStream;
+  }
+
+  try {
+    const currentTrack = baseStream.getVideoTracks()[0];
+    const currentSettings = currentTrack?.getSettings?.() || {};
+    if (currentSettings.facingMode === 'user') return baseStream;
+    const currentDeviceId = currentSettings.deviceId || '';
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const rearWideCandidates = devices.filter(device =>
+      device.kind === 'videoinput'
+      && device.deviceId
+      && !looksLikeFrontCamera(device.label)
+      && looksLikeUltraWideCamera(device.label)
+    );
+
+    const widePriority = device => {
+      if (device.deviceId === preferredWideRearDeviceId) return 0;
+      if (/ultra[\s-]*wide|ultrawide|0[.,]5\s*x/i.test(device.label || '')) return 1;
+      return 2;
+    };
+    rearWideCandidates.sort((left, right) =>
+      widePriority(left) - widePriority(right) || left.label.localeCompare(right.label)
+    );
+
+    const currentWide = rearWideCandidates.find(device => device.deviceId === currentDeviceId);
+    if (currentWide) {
+      preferredWideRearDeviceId = currentWide.deviceId;
+      await applyAccuracySafePhoneZoom(baseStream);
+      return baseStream;
+    }
+
+    const alternateCandidates = rearWideCandidates.filter(device => device.deviceId !== currentDeviceId);
+    if (!alternateCandidates.length) {
+      await applyAccuracySafePhoneZoom(baseStream);
+      return baseStream;
+    }
+
+    // Some phones cannot open a second rear lens while the current track is
+    // active. Release it before switching, and reopen the original device if
+    // every ultra-wide candidate fails.
+    stopStreamTracks(baseStream);
+    let lastSwitchError = null;
+    for (const device of alternateCandidates) {
+      let wideStream = null;
+      try {
+        wideStream = await openExactCameraDevice(device.deviceId);
+        const wideTrack = wideStream.getVideoTracks()[0];
+        const actualFacingMode = wideTrack?.getSettings?.().facingMode;
+        if (actualFacingMode === 'user') {
+          stopStreamTracks(wideStream);
+          continue;
+        }
+        await applyAccuracySafePhoneZoom(wideStream);
+        preferredWideRearDeviceId = device.deviceId;
+        return wideStream;
+      } catch (error) {
+        lastSwitchError = error;
+        stopStreamTracks(wideStream);
+        console.debug(`Could not open ultra-wide lens ${device.label || device.deviceId}:`, error);
+      }
+    }
+
+    if (currentDeviceId) {
+      try {
+        const restoredStream = await openExactCameraDevice(currentDeviceId);
+        await applyAccuracySafePhoneZoom(restoredStream);
+        return restoredStream;
+      } catch (restoreError) {
+        console.debug('Could not reopen the camera after trying the ultra-wide lens:', restoreError);
+        throw restoreError;
+      }
+    }
+    throw lastSwitchError || new Error('Could not switch to the ultra-wide camera.');
+  } catch (error) {
+    // If baseStream is still live, keep it. If it was released during a lens
+    // switch, bubble the error so requestCameraStream can retry its next safe
+    // camera constraint instead of returning a dead MediaStream.
+    if (baseStream?.getVideoTracks?.().some(track => track.readyState === 'live')) {
+      console.debug('Could not detect an ultra-wide camera on mobile:', error);
+      await applyAccuracySafePhoneZoom(baseStream);
+      return baseStream;
+    }
+    throw error;
   }
 }
 
@@ -342,14 +559,17 @@ async function requestCameraStream({ requireFacingMode = false } = {}) {
   let lastError = null;
   for (const constraints of attempts) {
     try {
-      const candidate = await navigator.mediaDevices.getUserMedia(constraints);
+      let candidate = await navigator.mediaDevices.getUserMedia(constraints);
       if (requireFacingMode) {
         const actualFacingMode = candidate.getVideoTracks()[0]?.getSettings?.().facingMode;
         if (actualFacingMode && actualFacingMode !== facingMode) {
           stopStreamTracks(candidate);
-          lastError = new DOMException('Camera trả về không đúng hướng yêu cầu.', 'OverconstrainedError');
+          lastError = new DOMException('The camera did not match the requested facing mode.', 'OverconstrainedError');
           continue;
         }
+      }
+      if (PHONE_CAMERA_MODE && facingMode === 'environment') {
+        candidate = await preferPhoneWideRearCamera(candidate);
       }
       return candidate;
     } catch (error) {
@@ -357,13 +577,13 @@ async function requestCameraStream({ requireFacingMode = false } = {}) {
       if (['NotAllowedError', 'SecurityError'].includes(error?.name)) break;
     }
   }
-  throw lastError || new Error('Không thể mở camera.');
+  throw lastError || new Error('Could not open the camera.');
 }
 
 async function startCamera({ requireFacingMode = false } = {}) {
   if (isBusy || isHistoryBusy || filePickerOpening || document.hidden) return false;
   if (!navigator.mediaDevices?.getUserMedia) {
-    cameraMessage.textContent = 'Trình duyệt không hỗ trợ camera. Hãy tải ảnh rác từ thiết bị.';
+    cameraMessage.textContent = 'This browser does not support camera access. Upload a waste image from your device.';
     captureButton.disabled = true;
     return false;
   }
@@ -373,7 +593,7 @@ async function startCamera({ requireFacingMode = false } = {}) {
   preview.hidden = true;
   video.hidden = false;
   cameraMessage.hidden = false;
-  cameraMessage.textContent = 'Đang khởi động camera...';
+  cameraMessage.textContent = 'Starting camera...';
 
   try {
     const newStream = await requestCameraStream({ requireFacingMode });
@@ -386,6 +606,7 @@ async function startCamera({ requireFacingMode = false } = {}) {
     stream = newStream;
     video.srcObject = newStream;
     await video.play();
+    syncPhoneVideoAspect();
 
     if (cameraRequestId !== cameraSequence || document.hidden || isBusy || isHistoryBusy || filePickerOpening || stream !== newStream) {
       stopStreamTracks(newStream);
@@ -418,7 +639,7 @@ function stopCamera() {
 
 function canvasToBlob(canvasElement, type = 'image/jpeg', quality = JPEG_QUALITY) {
   return new Promise((resolve, reject) => {
-    canvasElement.toBlob(blob => blob ? resolve(blob) : reject(new Error('Không thể tạo ảnh.')), type, quality);
+    canvasElement.toBlob(blob => blob ? resolve(blob) : reject(new Error('Could not create the image.')), type, quality);
   });
 }
 
@@ -460,7 +681,7 @@ async function optimizeUploadedImage(file) {
     source = await loadImageBitmap(file);
     const sourceWidth = source.width || source.naturalWidth;
     const sourceHeight = source.height || source.naturalHeight;
-    if (!sourceWidth || !sourceHeight) throw new Error('Không đọc được kích thước ảnh.');
+    if (!sourceWidth || !sourceHeight) throw new Error('Could not read the image dimensions.');
 
     const size = scaledSize(sourceWidth, sourceHeight);
     const workCanvas = document.createElement('canvas');
@@ -471,20 +692,20 @@ async function optimizeUploadedImage(file) {
     return await canvasToBlob(workCanvas, 'image/jpeg', JPEG_QUALITY);
   } catch (error) {
     if (supportedDirectTypes.has(file.type)) return file;
-    throw new Error('Định dạng ảnh này chưa được trình duyệt hỗ trợ. Hãy chọn JPEG, PNG hoặc WebP.');
+    throw new Error('This image format is not supported by the browser. Choose JPEG, PNG, or WebP.');
   } finally {
     if (source?.close) source.close();
   }
 }
 
-async function prepareCollectionImage(file) {
+async function prepareHighQualityImage(file) {
   const supportedDirectTypes = new Set(['image/jpeg', 'image/png', 'image/webp']);
   let source;
   try {
     source = await loadImageBitmap(file);
     const sourceWidth = source.width || source.naturalWidth;
     const sourceHeight = source.height || source.naturalHeight;
-    if (!sourceWidth || !sourceHeight) throw new Error('Không đọc được kích thước ảnh.');
+    if (!sourceWidth || !sourceHeight) throw new Error('Could not read the image dimensions.');
 
     const size = scaledSize(sourceWidth, sourceHeight, COLLECTION_MAX_DIMENSION);
     const canKeepOriginal = supportedDirectTypes.has(file.type)
@@ -501,14 +722,14 @@ async function prepareCollectionImage(file) {
     return await canvasToBlob(workCanvas, 'image/jpeg', COLLECTION_JPEG_QUALITY);
   } catch (error) {
     if (supportedDirectTypes.has(file.type) && file.size <= COLLECTION_DIRECT_MAX_BYTES) return file;
-    throw new Error('Không thể chuẩn bị ảnh chất lượng cao để lưu dataset.');
+    throw new Error('Could not prepare a high-quality image for classification.');
   } finally {
     if (source?.close) source.close();
   }
 }
 
 // --- Classification API Call ---
-async function requestClassification(blob, collectionBlob = null, options = {}) {
+async function requestClassification(blob, classifierBlob = null, collectionBlob = null, options = {}) {
   const requestId = ++requestSequence;
   activeRequestController?.abort();
   const controller = new AbortController();
@@ -518,8 +739,11 @@ async function requestClassification(blob, collectionBlob = null, options = {}) 
   formData.append('image', blob, 'waste-scan.jpg');
   formData.append('persist', options.persist === false ? 'false' : 'true');
   formData.append('source', options.source || 'user');
-  if (collectionBlob && collectionBlob !== blob) {
-    formData.append('collection_image', collectionBlob, 'waste-scan-hq.jpg');
+  if (classifierBlob && classifierBlob !== blob) {
+    formData.append('classifier_image', classifierBlob, 'waste-scan-classifier-hq.jpg');
+  }
+  if (collectionBlob) {
+    formData.append('collection_image', collectionBlob, 'waste-scan-collection-hq.jpg');
   }
 
   try {
@@ -531,7 +755,7 @@ async function requestClassification(blob, collectionBlob = null, options = {}) 
     });
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
-    if (!response.ok) throw new Error(payload.detail || `Máy chủ trả về lỗi ${response.status}.`);
+    if (!response.ok) throw new Error(payload.detail || `Server returned error ${response.status}.`);
 
     if (requestId !== requestSequence) return false;
     renderResult(payload);
@@ -541,7 +765,7 @@ async function requestClassification(blob, collectionBlob = null, options = {}) 
   } catch (error) {
     if (error.name === 'AbortError') return false;
     console.error(error);
-    showToast(error.message || 'Không thể phân tích ảnh.');
+    showToast(error.message || 'Could not analyze the image.');
     void refreshHealth();
     return false;
   } finally {
@@ -565,7 +789,7 @@ async function recoverScannerAfterFailure() {
 async function captureFrame() {
   if (isBusy || isHistoryBusy) return;
   if (!stream || !video.videoWidth) {
-    showToast('Camera chưa sẵn sàng.');
+    showToast('Camera is not ready.');
     return;
   }
 
@@ -597,10 +821,14 @@ async function captureFrame() {
     selectedBlob = await canvasToBlob(canvas, 'image/jpeg', JPEG_QUALITY);
     showPreview(collectionBlob);
     stopCamera();
-    classificationSucceeded = await requestClassification(selectedBlob, collectionBlob);
+    classificationSucceeded = await requestClassification(
+      selectedBlob,
+      collectionBlob,
+      collectionBlob
+    );
   } catch (error) {
     console.error(error);
-    showToast(error.message || 'Không thể chụp hoặc phân tích ảnh.');
+    showToast(error.message || 'Could not capture or analyze the image.');
   } finally {
     setBusy(false);
     if (!classificationSucceeded) await recoverScannerAfterFailure();
@@ -636,7 +864,7 @@ function renderLearningMemory(result) {
   }
   const similarity = Math.round(Number(info.best_similarity || 0) * 100);
   const matched = Number(info.matched_examples || 0);
-  learningMemoryBadge.textContent = `🧠 Đã tham khảo ${matched} mẫu đã xác nhận trong bộ nhớ dùng chung · tương đồng cao nhất ${similarity}%`;
+  learningMemoryBadge.textContent = `🧠 Referenced ${matched} confirmed samples in shared memory · highest similarity ${similarity}%`;
   learningMemoryBadge.hidden = false;
 }
 
@@ -649,9 +877,9 @@ async function refreshLearningStats() {
     if (!response.ok) return;
     const total = Number(payload.learnable_examples || 0);
     const corrected = Number(payload.corrected || 0);
-    learningExampleCount.textContent = `Bộ nhớ học dùng chung: ${total} mẫu · ${corrected} phản hồi đã sửa AI`;
+    learningExampleCount.textContent = `Shared learning memory: ${total} samples · ${corrected} AI corrections`;
   } catch (error) {
-    console.warn('Không thể tải thống kê học:', error);
+    console.warn('Could not load learning statistics:', error);
   }
 }
 
@@ -663,7 +891,7 @@ async function postFeedback(scanId, correctKey) {
   });
   let payload = {};
   try { payload = await response.json(); } catch (_) { /* ignore */ }
-  if (!response.ok) throw new Error(payload.detail || 'Không thể lưu phản hồi.');
+  if (!response.ok) throw new Error(payload.detail || 'Could not save feedback.');
   return payload;
 }
 
@@ -676,12 +904,12 @@ function updateResultConfidenceLabel(result) {
   );
   if (correctedPrediction) {
     label.textContent = memoryAdjusted
-      ? 'Điểm phù hợp trước khi bạn sửa'
-      : 'Độ tin cậy dự đoán AI ban đầu';
+      ? 'Match score before your correction'
+      : 'Initial AI prediction confidence';
   } else {
     label.textContent = memoryAdjusted
-      ? 'Điểm phù hợp sau bộ nhớ'
-      : 'Mức phù hợp AI';
+      ? 'Match score after memory adjustment'
+      : 'AI match score';
   }
 }
 
@@ -699,14 +927,19 @@ function applyFeedbackResult(payload) {
   }
 
   const hasUserLabel = Boolean(currentResult.corrected_key);
-  document.getElementById('resultIcon').textContent =
-    currentResult.uncertain && !hasUserLabel ? '❓' : currentResult.icon;
-  document.getElementById('resultCategory').textContent =
-    currentResult.uncertain && !hasUserLabel ? 'AI chưa đủ chắc chắn' : currentResult.category;
+  document.getElementById('resultIcon').textContent = currentResult.icon;
+  const categoryEl = document.getElementById('resultCategory');
+  if (currentResult.uncertain && !hasUserLabel) {
+    categoryEl.textContent = `${currentResult.category} · Low confidence`;
+  } else {
+    categoryEl.textContent = currentResult.category;
+  }
   document.getElementById('resultName').textContent = currentResult.display_name;
   document.getElementById('resultBin').textContent = currentResult.bin_name;
   document.getElementById('resultInstruction').textContent = currentResult.instruction;
   updateResultConfidenceLabel(currentResult);
+  renderObjectSelector();
+  renderDetectionOverlay();
 }
 
 async function submitFeedback(correctKey) {
@@ -714,47 +947,182 @@ async function submitFeedback(correctKey) {
   const scanId = currentResult.scan_id;
   feedbackSubmitting = true;
   updateControlState();
-  if (feedbackStatus) feedbackStatus.textContent = 'Đang lưu phản hồi...';
+  if (feedbackStatus) feedbackStatus.textContent = 'Saving feedback...';
   try {
     const payload = await postFeedback(scanId, correctKey);
     // Controls are locked while feedback is in-flight, but keep this identity
     // check as a second guard against stale async responses.
     if (currentResult?.scan_id === scanId) {
       // Keep the effective feedback label in sync with the server. Without this,
-      // pressing "Đúng" after a correction would submit the original AI key
+      // pressing "Correct" after a correction would submit the original AI key
       // again and silently undo the user's correction.
       applyFeedbackResult(payload);
       populateFeedbackCategories(payload.corrected_key);
-      if (feedbackStatus) feedbackStatus.textContent = payload.message || 'Đã lưu phản hồi.';
+      if (feedbackStatus) feedbackStatus.textContent = payload.message || 'Feedback saved.';
       if (feedbackCorrection) feedbackCorrection.hidden = true;
     }
-    showToast(payload.message || 'Đã lưu phản hồi.');
+    showToast(payload.message || 'Feedback saved.');
     void loadHistory({ reset: true });
     void refreshLearningStats();
   } catch (error) {
     console.error(error);
-    if (feedbackStatus) feedbackStatus.textContent = error.message || 'Không thể lưu phản hồi.';
-    showToast(error.message || 'Không thể lưu phản hồi.');
+    if (feedbackStatus) feedbackStatus.textContent = error.message || 'Could not save feedback.';
+    showToast(error.message || 'Could not save feedback.');
   } finally {
     feedbackSubmitting = false;
     updateControlState();
   }
 }
 
-// --- Render Result Card ---
-function renderResult(result) {
+// --- Render Multi-object Result ---
+function activeObject() {
+  return currentObjects[activeObjectIndex] || null;
+}
+
+function renderObjectSelector() {
+  if (!objectResults) return;
+  if (!currentObjects.length) {
+    objectResults.replaceChildren();
+    objectResults.hidden = true;
+    return;
+  }
+
+  const buttons = currentObjects.map((item, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `object-result-button${index === activeObjectIndex ? ' active' : ''}`;
+    button.dataset.objectIndex = String(index);
+
+    const title = document.createElement('div');
+    title.className = 'object-result-title';
+    const name = document.createElement('span');
+    name.textContent = `${index + 1}. ${visibleObjectName(item)}`;
+    const score = document.createElement('strong');
+    score.textContent = `${Math.round(Number(item.confidence || 0) * 100)}%`;
+    title.append(name, score);
+
+    const meta = document.createElement('div');
+    meta.className = 'object-result-meta';
+    if (item.detected === false || item.fallback_full_frame) {
+      const label = item.fallback_full_frame ? 'Full-frame fallback' : 'No detector bounding box';
+      meta.classList.add('object-result-warning');
+      meta.textContent = label;
+    } else {
+      const detectorScore = item.detector_confidence == null
+        ? ''
+        : ` · detection ${Math.round(Number(item.detector_confidence) * 100)}%`;
+      const uncertainLabel = item.uncertain ? ' · Low confidence' : '';
+      meta.textContent = `${item.category || 'Unknown'}${uncertainLabel}${detectorScore}`;
+    }
+
+    button.append(title, meta);
+    button.addEventListener('click', () => selectObject(index));
+    return button;
+  });
+
+  objectResults.replaceChildren(...buttons);
+  objectResults.hidden = currentObjects.length <= 1;
+}
+
+function renderDetectionOverlay() {
+  if (!detectionOverlay) return;
+  detectionOverlay.replaceChildren();
+
+  if (preview.hidden || !preview.src || !preview.naturalWidth || !preview.naturalHeight) {
+    detectionOverlay.hidden = true;
+    return;
+  }
+
+  const detectedObjects = currentObjects.filter(item => item.detected !== false && item.bbox);
+  if (!detectedObjects.length) {
+    detectionOverlay.hidden = true;
+    return;
+  }
+
+  const shell = preview.parentElement;
+  if (!shell) {
+    detectionOverlay.hidden = true;
+    return;
+  }
+
+  const containerWidth = shell.clientWidth;
+  const containerHeight = shell.clientHeight;
+  if (!containerWidth || !containerHeight) {
+    detectionOverlay.hidden = true;
+    return;
+  }
+
+  // Phones use object-fit: contain to keep the full wide frame visible.
+  // Desktop/laptop keeps object-fit: cover. Match the active CSS geometry here.
+  const scaleForWidth = containerWidth / preview.naturalWidth;
+  const scaleForHeight = containerHeight / preview.naturalHeight;
+  const scale = PHONE_CAMERA_MODE
+    ? Math.min(scaleForWidth, scaleForHeight)
+    : Math.max(scaleForWidth, scaleForHeight);
+  const renderedWidth = preview.naturalWidth * scale;
+  const renderedHeight = preview.naturalHeight * scale;
+  const offsetX = (containerWidth - renderedWidth) / 2;
+  const offsetY = (containerHeight - renderedHeight) / 2;
+
+  currentObjects.forEach((item, index) => {
+    if (item.detected === false || !item.bbox) return;
+    const bbox = item.bbox;
+    const rawLeft = offsetX + Number(bbox.x1 || 0) * renderedWidth;
+    const rawTop = offsetY + Number(bbox.y1 || 0) * renderedHeight;
+    const rawRight = offsetX + Number(bbox.x2 || 0) * renderedWidth;
+    const rawBottom = offsetY + Number(bbox.y2 || 0) * renderedHeight;
+
+    const left = Math.max(0, Math.min(containerWidth, rawLeft));
+    const top = Math.max(0, Math.min(containerHeight, rawTop));
+    const right = Math.max(0, Math.min(containerWidth, rawRight));
+    const bottom = Math.max(0, Math.min(containerHeight, rawBottom));
+    if (right - left < 2 || bottom - top < 2) return;
+
+    const box = document.createElement('div');
+    box.className = `detection-box${index === activeObjectIndex ? ' active' : ''}`;
+    box.style.left = `${left}px`;
+    box.style.top = `${top}px`;
+    box.style.width = `${right - left}px`;
+    box.style.height = `${bottom - top}px`;
+    box.dataset.objectIndex = String(index);
+    box.setAttribute('role', 'button');
+    box.setAttribute('aria-label', `Select object ${index + 1}: ${visibleObjectName(item, 'object')}`);
+    box.tabIndex = 0;
+
+    const label = document.createElement('span');
+    label.className = `detection-box-label${top < 28 ? ' inside' : ''}`;
+    label.textContent = `${index + 1}. ${visibleObjectName(item)} · ${Math.round(Number(item.confidence || 0) * 100)}%`;
+    box.append(label);
+
+    const activate = () => selectObject(index);
+    box.addEventListener('click', activate);
+    box.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        activate();
+      }
+    });
+    detectionOverlay.append(box);
+  });
+
+  detectionOverlay.hidden = detectionOverlay.childElementCount === 0;
+}
+
+function renderActiveObject(result) {
   currentResult = result;
+  if (!result) return;
+
   if (feedbackStatus) {
     if (result.source === 'demo') {
-      feedbackStatus.textContent = 'Ảnh minh họa chỉ dùng thử; không lưu lịch sử, không học feedback và không thêm vào dataset.';
+      feedbackStatus.textContent = 'Sample images are for demonstration only; they are not saved to history, used for feedback learning, or added to the dataset.';
     } else if (result.history_saved === false || !result.scan_id) {
-      feedbackStatus.textContent = 'Kết quả này không được lưu vì lịch sử đã bị xóa trong lúc AI xử lý. Hãy quét lại để lưu và phản hồi.';
+      feedbackStatus.textContent = 'This object was not saved to history, so feedback is unavailable.';
     } else if (result.learning?.enabled === false) {
-      feedbackStatus.textContent = 'Bạn có thể xác nhận hoặc sửa kết quả; chức năng học từ phản hồi hiện đang tắt.';
+      feedbackStatus.textContent = 'You can confirm or correct the selected object; feedback learning is currently disabled.';
     } else if (result.learning?.feedback_available === false) {
-      feedbackStatus.textContent = 'Bạn vẫn có thể phản hồi, nhưng lần quét này không có vector đặc trưng để dùng làm mẫu học.';
+      feedbackStatus.textContent = 'You can still provide feedback for the selected object, but it has no feature vector to use as a learning sample.';
     } else {
-      feedbackStatus.textContent = 'Xác nhận hoặc sửa kết quả để AI học từ vật thể này.';
+      feedbackStatus.textContent = 'Confirm or correct the selected object so the AI can learn from this exact crop.';
     }
   }
   if (feedbackCorrection) feedbackCorrection.hidden = true;
@@ -762,20 +1130,24 @@ function renderResult(result) {
   renderLearningMemory(result);
 
   const hasUserLabel = Boolean(result.corrected_key);
-  document.getElementById('resultIcon').textContent =
-    result.uncertain && !hasUserLabel ? '❓' : result.icon;
-  document.getElementById('resultCategory').textContent =
-    result.uncertain && !hasUserLabel ? 'AI chưa đủ chắc chắn' : result.category;
-  document.getElementById('resultName').textContent = result.display_name;
+  document.getElementById('resultIcon').textContent = result.icon;
+  const categoryEl = document.getElementById('resultCategory');
+  if (result.uncertain && !hasUserLabel) {
+    categoryEl.textContent = `${result.category} · Low confidence`;
+    categoryEl.title = (result.uncertainty_reasons || []).join(', ') || 'AI confidence is below the threshold';
+  } else {
+    categoryEl.textContent = result.category;
+    categoryEl.title = '';
+  }
+  document.getElementById('resultName').textContent = visibleObjectName(result);
   document.getElementById('resultBin').textContent = result.bin_name;
   document.getElementById('resultInstruction').textContent = result.instruction;
   document.getElementById('resultNotice').textContent = result.notice;
 
-  const percentage = Math.round(result.confidence * 100);
+  const percentage = Math.round(Number(result.confidence || 0) * 100);
   document.getElementById('resultConfidence').textContent = `${percentage}%`;
   updateResultConfidenceLabel(result);
-  
-  // Radial Gauge Animation
+
   const gaugeProgress = document.getElementById('gaugeProgress');
   if (gaugeProgress) {
     const circumference = 264;
@@ -795,10 +1167,70 @@ function renderResult(result) {
     return row;
   }));
 
-  resultSection.hidden = false;
   updateControlState();
+}
+
+function selectObject(index, { scroll = false } = {}) {
+  if (!Number.isInteger(index) || index < 0 || index >= currentObjects.length) return;
+  activeObjectIndex = index;
+  renderActiveObject(currentObjects[index]);
+  renderObjectSelector();
+  renderDetectionOverlay();
+  if (scroll) resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderResult(payload) {
+  currentResponse = payload;
+  const payloadObjects = Array.isArray(payload.objects) ? payload.objects : null;
+
+  if (payload.no_detection === true || (payloadObjects && payloadObjects.length === 0)) {
+    currentObjects = [];
+    currentResult = null;
+    activeObjectIndex = 0;
+    renderObjectSelector();
+    if (detectionOverlay) {
+      detectionOverlay.replaceChildren();
+      detectionOverlay.hidden = true;
+    }
+    if (resultCard) resultCard.hidden = true;
+    if (objectSummary) {
+      objectSummary.textContent = payload.notice
+        || 'No waste object was detected clearly. Move the object closer to the camera and capture another image.';
+      objectSummary.hidden = false;
+    }
+    resultSection.hidden = false;
+    updateControlState();
+    resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    return;
+  }
+
+  currentObjects = payloadObjects?.length ? payloadObjects : [payload];
+  activeObjectIndex = 0;
+  if (resultCard) resultCard.hidden = false;
+
+  if (objectSummary) {
+    const fallbackFullFrame = payload.detector?.fallback_full_frame === true
+      || payload.fallback_full_frame === true;
+    if (fallbackFullFrame) {
+      objectSummary.textContent = 'No eligible object was detected. The full image was classified instead.';
+    } else {
+      const count = currentObjects.length;
+      objectSummary.textContent = `Detected ${count} object${count === 1 ? '' : 's'}. Select a box or card below to inspect and provide feedback for each object individually.`;
+    }
+    objectSummary.hidden = false;
+  }
+
+  resultSection.hidden = false;
+  selectObject(0);
+  requestAnimationFrame(renderDetectionOverlay);
   resultSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
+
+preview?.addEventListener('load', () => requestAnimationFrame(renderDetectionOverlay));
+window.addEventListener('resize', () => {
+  if (currentObjects.length) requestAnimationFrame(renderDetectionOverlay);
+});
+
 
 // --- Drag and Drop File Handling ---
 ['dragenter', 'dragover'].forEach(eventName => {
@@ -833,15 +1265,20 @@ async function processSelectedFile(file, options = {}) {
     stopCamera();
     showPreview(file);
     const shouldPersist = options.persist !== false;
-    const [inferenceBlob, collectionBlob] = await Promise.all([
+    const [inferenceBlob, classifierBlob] = await Promise.all([
       optimizeUploadedImage(file),
-      shouldPersist ? prepareCollectionImage(file) : Promise.resolve(null)
+      prepareHighQualityImage(file)
     ]);
     selectedBlob = inferenceBlob;
-    classificationSucceeded = await requestClassification(inferenceBlob, collectionBlob, options);
+    classificationSucceeded = await requestClassification(
+      inferenceBlob,
+      classifierBlob,
+      shouldPersist ? classifierBlob : null,
+      options
+    );
   } catch (error) {
     console.error(error);
-    showToast(error.message || 'Không thể đọc hoặc phân tích ảnh.');
+    showToast(error.message || 'Could not read or analyze the image.');
   } finally {
     setBusy(false);
     if (!classificationSucceeded) await recoverScannerAfterFailure();
@@ -864,12 +1301,12 @@ document.querySelectorAll('.chip-btn').forEach(btn => {
 
     try {
       const response = await fetch(sampleUrl, { cache: 'force-cache' });
-      if (!response.ok) throw new Error('Không thể tải ảnh minh họa mẫu.');
+      if (!response.ok) throw new Error('Could not load the sample image.');
       const blob = await response.blob();
       await processSelectedFile(blob, { source: 'demo', persist: false });
     } catch (error) {
       console.error(error);
-      showToast(error.message || 'Không thể mở ảnh minh họa mẫu.');
+      showToast(error.message || 'Could not open the sample image.');
     }
   });
 });
@@ -879,7 +1316,7 @@ async function loadCatalog() {
   if (!catalogGrid) return;
   try {
     const res = await fetch('/api/categories');
-    if (!res.ok) throw new Error(`Máy chủ trả về lỗi ${res.status}.`);
+    if (!res.ok) throw new Error(`Server returned error ${res.status}.`);
     const data = await res.json();
     catalogItems = Array.isArray(data) ? data : [];
     populateFeedbackCategories(currentResult?.corrected_key || currentResult?.key || '');
@@ -915,10 +1352,10 @@ async function loadCatalog() {
       return card;
     }));
   } catch (err) {
-    console.error('Lỗi tải danh mục:', err);
+    console.error('Error loading catalog:', err);
     const message = document.createElement('div');
     message.className = 'catalog-loading';
-    message.textContent = 'Không thể tải danh mục phân loại. Vui lòng tải lại trang hoặc kiểm tra kết nối.';
+    message.textContent = 'Could not load the classification catalog. Reload the page or check your connection.';
     catalogGrid.replaceChildren(message);
   }
 }
@@ -926,7 +1363,7 @@ async function loadCatalog() {
 // --- History Drawer & Statistics ---
 function formatDate(value) {
   const date = new Date(value);
-  return new Intl.DateTimeFormat('vi-VN', {
+  return new Intl.DateTimeFormat('en-US', {
     dateStyle: 'short', timeStyle: 'short'
   }).format(date);
 }
@@ -954,7 +1391,7 @@ function updateHistoryStats(statistics = {}, historyTotal = null) {
 
 
 function displayNameForKey(key) {
-  if (!key) return 'Chưa xác nhận';
+  if (!key) return 'Unconfirmed';
   return catalogItems.find(item => item.key === key)?.display_name || key;
 }
 
@@ -976,7 +1413,7 @@ async function getHistoryThumbnailUrl(item) {
     historyThumbnailUrls.set(item.id, url);
     return url;
   } catch (error) {
-    console.warn(`Không thể tải thumbnail scan ${item.id}:`, error);
+    console.warn(`Could not load thumbnail for scan ${item.id}:`, error);
     return null;
   }
 }
@@ -1029,7 +1466,7 @@ async function attachHistoryThumbnail(item, imageElement, placeholderElement) {
   } else {
     imageElement.hidden = true;
     placeholderElement.hidden = false;
-    placeholderElement.textContent = 'Không tải được ảnh';
+    placeholderElement.textContent = 'Image could not be loaded';
   }
 }
 
@@ -1048,7 +1485,7 @@ async function openHistoryEditor(item) {
   const modelUncertain = item.model_uncertain ?? item.uncertain;
   const modelConfidence = Number(item.model_confidence ?? item.confidence ?? 0);
   if (historyEditPredicted) {
-    historyEditPredicted.textContent = `${modelDisplayName} · ${modelCategory}${modelUncertain ? ' · AI chưa chắc chắn' : ''}`;
+    historyEditPredicted.textContent = `${modelDisplayName} · ${modelCategory}${modelUncertain ? ' · AI uncertain' : ''}`;
   }
   if (historyEditConfidence) {
     historyEditConfidence.textContent = `${modelUncertain ? '~' : ''}${Math.round(modelConfidence * 100)}%`;
@@ -1058,20 +1495,20 @@ async function openHistoryEditor(item) {
     historyEditCurrentLabel.textContent = item.corrected_key
       ? displayNameForKey(item.corrected_key)
       : (item.memory_applied
-          ? 'Chưa xác nhận · đang dùng kết quả sau bộ nhớ học'
-          : 'Chưa xác nhận · đang dùng dự đoán AI');
+          ? 'Unconfirmed · using the memory-adjusted result'
+          : 'Unconfirmed · using the AI prediction');
   }
   if (historyEditStatus) {
     historyEditStatus.textContent = item.thumbnail_available
-      ? 'Đối chiếu ảnh rồi chọn nhãn đúng. Lưu lại sẽ cập nhật ngay bộ nhớ học.'
-      : 'Bản ghi này không còn thumbnail. Bạn vẫn có thể sửa nhãn nếu nhận ra lần quét từ thông tin bên cạnh.';
+      ? 'Review the image and select the correct label. Saving will update learning memory immediately.'
+      : 'This record no longer has a thumbnail. You can still edit the label if you recognize the scan from the nearby details.';
   }
   if (historyEditImage) {
     historyEditImage.removeAttribute('src');
     historyEditImage.hidden = true;
   }
   if (historyEditImagePlaceholder) {
-    historyEditImagePlaceholder.textContent = item.thumbnail_available ? 'Đang tải ảnh...' : 'Ảnh cũ không có thumbnail';
+    historyEditImagePlaceholder.textContent = item.thumbnail_available ? 'Loading image...' : 'No thumbnail is available for this older scan';
     historyEditImagePlaceholder.hidden = false;
   }
 
@@ -1098,12 +1535,15 @@ async function saveHistoryEdit() {
   if (!historyEditItem?.id || !correctKey || feedbackSubmitting) return;
   feedbackSubmitting = true;
   updateControlState();
-  if (historyEditStatus) historyEditStatus.textContent = 'Đang cập nhật nhãn...';
+  if (historyEditStatus) historyEditStatus.textContent = 'Updating label...';
   try {
     const payload = await postFeedback(historyEditItem.id, correctKey);
     historyEditItem.corrected_key = payload.corrected_key;
     historyEditItem.is_correct = payload.is_correct;
-    if (currentResult?.scan_id === historyEditItem.id) {
+    const liveObjectIndex = currentObjects.findIndex(object => object?.scan_id === historyEditItem.id);
+    if (liveObjectIndex >= 0) {
+      activeObjectIndex = liveObjectIndex;
+      currentResult = currentObjects[liveObjectIndex];
       applyFeedbackResult(payload);
       populateFeedbackCategories(payload.corrected_key);
     }
@@ -1113,14 +1553,14 @@ async function saveHistoryEdit() {
       cached.is_correct = payload.is_correct;
     }
     if (historyEditCurrentLabel) historyEditCurrentLabel.textContent = displayNameForKey(payload.corrected_key);
-    if (historyEditStatus) historyEditStatus.textContent = payload.message || 'Đã cập nhật nhãn.';
+    if (historyEditStatus) historyEditStatus.textContent = payload.message || 'Label updated.';
     await loadHistory({ reset: true });
     void refreshLearningStats();
-    showToast(payload.message || `Đã cập nhật nhãn thành ${displayNameForKey(payload.corrected_key)}.`);
+    showToast(payload.message || `Label updated to ${displayNameForKey(payload.corrected_key)}.`);
   } catch (error) {
     console.error(error);
-    if (historyEditStatus) historyEditStatus.textContent = error.message || 'Không thể cập nhật bản ghi.';
-    showToast(error.message || 'Không thể cập nhật bản ghi.');
+    if (historyEditStatus) historyEditStatus.textContent = error.message || 'Could not update the record.';
+    showToast(error.message || 'Could not update the record.');
   } finally {
     feedbackSubmitting = false;
     updateControlState();
@@ -1128,10 +1568,10 @@ async function saveHistoryEdit() {
 }
 
 function requestHistoryDeletePassword() {
-  const password = window.prompt('Nhập mật khẩu xóa lịch sử:');
+  const password = window.prompt('Enter the history deletion password:');
   if (password === null) return null;
   if (!password.trim()) {
-    showToast('Không đúng mật khẩu.');
+    showToast('Incorrect password.');
     return null;
   }
   return password;
@@ -1142,7 +1582,7 @@ async function deleteHistoryItem(item) {
 
   const itemName = item.display_name;
   const confirmed = window.confirm(
-    `Xóa “${itemName}” khỏi lịch sử? Ảnh, phản hồi và dữ liệu học của riêng lần quét này cũng sẽ bị xóa. Thao tác này không thể hoàn tác.`
+    `Delete “${itemName}” from history? The image, feedback, and learning data for this scan will also be deleted. This action cannot be undone.`
   );
   if (!confirmed) return;
   const deletePassword = requestHistoryDeletePassword();
@@ -1157,8 +1597,9 @@ async function deleteHistoryItem(item) {
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
     if (!response.ok) {
-      if (response.status === 401 || response.status === 503) throw new Error('Không đúng mật khẩu.');
-      throw new Error(payload.detail || 'Không thể xóa lần quét này.');
+      if (response.status === 401) throw new Error('Incorrect password.');
+      if (response.status === 503) throw new Error(payload.detail || 'History service is temporarily unavailable.');
+      throw new Error(payload.detail || 'Could not delete this scan.');
     }
 
     releaseHistoryThumbnailUrl(item.id);
@@ -1167,22 +1608,30 @@ async function deleteHistoryItem(item) {
       historyEditModal.setAttribute('aria-hidden', 'true');
       historyEditItem = null;
     }
-    if (currentResult?.scan_id === item.id) {
-      // Keep the visible classification card as a reference, but it no longer has
-      // a backing DB row for feedback after this history item is deleted.
-      currentResult = null;
-      if (feedbackCorrection) feedbackCorrection.hidden = true;
-      if (feedbackStatus) feedbackStatus.textContent = '';
+    const liveObjectIndex = currentObjects.findIndex(object => object?.scan_id === item.id);
+    if (liveObjectIndex >= 0) {
+      // Keep the detected object visible, but invalidate only this object's
+      // DB-backed feedback identity. Other objects from the same camera frame
+      // remain independently editable.
+      currentObjects[liveObjectIndex].scan_id = null;
+      currentObjects[liveObjectIndex].history_saved = false;
+      if (activeObjectIndex === liveObjectIndex) {
+        currentResult = currentObjects[liveObjectIndex];
+        if (feedbackCorrection) feedbackCorrection.hidden = true;
+        if (feedbackStatus) feedbackStatus.textContent = 'This object was deleted from history; scan it again if you want to provide feedback.';
+      }
+      renderObjectSelector();
+      updateControlState();
     }
 
     cachedHistoryItems = cachedHistoryItems.filter(entry => entry.id !== item.id);
     await loadHistory({ reset: true });
     await refreshLearningStats();
 
-    showToast(`Đã xóa lần quét #${item.id}. ID đã dùng sẽ không được tái sử dụng để tránh ghép nhầm dữ liệu.`);
+    showToast(`Deleted object #${item.id}. Used IDs will not be reused to prevent data from being matched incorrectly.`);
   } catch (error) {
     console.error(error);
-    showToast(error.message || 'Không thể xóa lần quét này.');
+    showToast(error.message || 'Could not delete this scan.');
   } finally {
     setHistoryBusy(false);
   }
@@ -1193,8 +1642,8 @@ function renderHistoryItems(items) {
     const empty = document.createElement('div');
     empty.className = 'empty-history';
     empty.textContent = (historySearch?.value || '').trim()
-      ? 'Không tìm thấy lịch sử phù hợp.'
-      : 'Chưa có lịch sử quét rác.';
+      ? 'No matching history found.'
+      : 'No waste scan history yet.';
     historyList.replaceChildren(empty);
     return;
   }
@@ -1206,7 +1655,7 @@ function renderHistoryItems(items) {
     const thumbButton = document.createElement('button');
     thumbButton.className = 'history-thumb-button';
     thumbButton.type = 'button';
-    thumbButton.setAttribute('aria-label', `Xem ảnh và sửa nhãn cho ${item.display_name}`);
+    thumbButton.setAttribute('aria-label', `View image and edit label for ${item.display_name}`);
     thumbButton.addEventListener('click', () => { void openHistoryEditor(item); });
 
     const thumb = document.createElement('img');
@@ -1215,7 +1664,7 @@ function renderHistoryItems(items) {
     thumb.hidden = true;
     const thumbPlaceholder = document.createElement('span');
     thumbPlaceholder.className = 'history-thumb-placeholder';
-    thumbPlaceholder.textContent = item.thumbnail_available ? '…' : 'Không ảnh';
+    thumbPlaceholder.textContent = item.thumbnail_available ? '…' : 'No image';
     thumbButton.append(thumb, thumbPlaceholder);
     void attachHistoryThumbnail(item, thumb, thumbPlaceholder);
 
@@ -1227,9 +1676,9 @@ function renderHistoryItems(items) {
 
     const meta = document.createElement('small');
     const feedbackText = item.corrected_key
-      ? (item.is_correct ? ' · Đã xác nhận đúng' : ' · Đã sửa nhãn')
-      : ' · Chưa xác nhận';
-    meta.textContent = `${item.category}${item.uncertain ? ' · Chưa chắc chắn' : ''}${feedbackText} · ${formatDate(item.created_at)}`;
+      ? (item.is_correct ? ' · Confirmed correct' : ' · Label corrected')
+      : ' · Unconfirmed';
+    meta.textContent = `${item.category}${item.uncertain ? ' · Uncertain' : ''}${feedbackText} · ${formatDate(item.created_at)}`;
 
     const itemActions = document.createElement('div');
     itemActions.className = 'history-item-actions';
@@ -1237,14 +1686,14 @@ function renderHistoryItems(items) {
     const editButton = document.createElement('button');
     editButton.className = 'history-edit-button';
     editButton.type = 'button';
-    editButton.textContent = item.corrected_key ? 'Xem / sửa lại' : 'Xem / sửa nhãn';
+    editButton.textContent = item.corrected_key ? 'View / edit again' : 'View / edit label';
     editButton.addEventListener('click', () => { void openHistoryEditor(item); });
 
     const deleteButton = document.createElement('button');
     deleteButton.className = 'history-delete-button';
     deleteButton.type = 'button';
-    deleteButton.textContent = 'Xóa';
-    deleteButton.setAttribute('aria-label', `Xóa ${item.display_name} khỏi lịch sử`);
+    deleteButton.textContent = 'Delete';
+    deleteButton.setAttribute('aria-label', `Delete ${item.display_name} from history`);
     deleteButton.addEventListener('click', () => { void deleteHistoryItem(item); });
 
     itemActions.append(editButton, deleteButton);
@@ -1257,7 +1706,7 @@ function renderHistoryItems(items) {
     // If the user corrected the item to another class, show correction state
     // instead of attaching the original model confidence to the new label.
     if (item.corrected_key && item.is_correct === false) {
-      score.textContent = 'Đã sửa';
+      score.textContent = 'Corrected';
     } else {
       const effectiveScore = Number(item.effective_score ?? item.confidence ?? 0);
       const effectiveUncertain = item.effective_uncertain ?? item.uncertain;
@@ -1297,7 +1746,7 @@ async function loadHistory({ reset = true } = {}) {
     const response = await fetch(`/api/history?${params}`, { signal: controller.signal });
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
-    if (!response.ok) throw new Error(payload.detail || 'Không thể tải lịch sử.');
+    if (!response.ok) throw new Error(payload.detail || 'Could not load history.');
     if (requestId !== historyRequestSequence) return;
 
     const items = Array.isArray(payload.items) ? payload.items : [];
@@ -1334,7 +1783,7 @@ async function loadHistory({ reset = true } = {}) {
       empty.textContent = error.message;
       historyList.replaceChildren(empty);
     } else {
-      showToast(error.message || 'Không thể tải thêm lịch sử.');
+      showToast(error.message || 'Could not load more history.');
     }
   } finally {
     if (requestId === historyRequestSequence) {
@@ -1383,8 +1832,8 @@ switchCameraButton.addEventListener('click', async () => {
     if (!document.hidden) {
       const restored = await startCamera();
       showToast(restored
-        ? 'Không thể chuyển camera; đã quay lại camera trước.'
-        : 'Không thể chuyển camera và cũng không thể khôi phục camera trước.');
+        ? 'Could not switch cameras; restored the previous camera.'
+        : 'Could not switch cameras and could not restore the previous camera.');
     }
   }
 });
@@ -1472,7 +1921,7 @@ document.querySelectorAll('[data-close-drawer]').forEach(element => element.addE
 clearHistoryButton.addEventListener('click', async () => {
   if (isBusy || isHistoryBusy || feedbackSubmitting) return;
   const confirmed = window.confirm(
-    'Xóa toàn bộ lịch sử dùng chung? Thao tác này xóa thumbnail, bộ nhớ học và các ảnh dataset đã thu thập từ những lần quét này. ID đã dùng sẽ không được tái sử dụng để tránh ghép nhầm dữ liệu. Không thể hoàn tác.'
+    'Clear all shared history? This deletes thumbnails, learning memory, and dataset images collected from these scans. Used IDs will not be reused to prevent incorrect data matching. This action cannot be undone.'
   );
   if (!confirmed) return;
   const deletePassword = requestHistoryDeletePassword();
@@ -1486,20 +1935,28 @@ clearHistoryButton.addEventListener('click', async () => {
     let payload = {};
     try { payload = await response.json(); } catch (_) { /* ignore */ }
     if (!response.ok) {
-      if (response.status === 401 || response.status === 503) throw new Error('Không đúng mật khẩu.');
-      throw new Error(payload.detail || 'Không thể xóa lịch sử.');
+      if (response.status === 401) throw new Error('Incorrect password.');
+      if (response.status === 503) throw new Error(payload.detail || 'History service is temporarily unavailable.');
+      throw new Error(payload.detail || 'Could not clear history.');
     }
     releaseHistoryThumbnailUrls();
     closeHistoryEditor();
-    // The visible result may refer to a scan that was just deleted. Keep the
-    // result card for reference, but invalidate its DB-backed feedback actions.
-    currentResult = null;
+    // Keep the visible multi-object result for reference, but invalidate every
+    // DB-backed scan_id because the shared history was cleared.
+    currentObjects.forEach(object => {
+      object.scan_id = null;
+      object.history_saved = false;
+    });
+    currentResult = activeObject();
     if (feedbackCorrection) feedbackCorrection.hidden = true;
-    if (feedbackStatus) feedbackStatus.textContent = '';
+    if (feedbackStatus) feedbackStatus.textContent = currentResult
+      ? 'History has been cleared; scan this object again if you want to provide feedback.'
+      : '';
+    renderObjectSelector();
     updateControlState();
     await loadHistory({ reset: true });
     await refreshLearningStats();
-    showToast('Đã xóa sạch lịch sử. ID cũ được giữ làm mốc và sẽ không bị tái sử dụng.');
+    showToast('History cleared. Previous IDs are retained as markers and will not be reused.');
   } catch (error) {
     showToast(error.message);
   } finally {
@@ -1525,11 +1982,11 @@ setBusy(false);
 filePickerOpening = false;
 initTheme();
 if (!clientIdentity.persistent) {
-  console.warn('Trình duyệt đang chặn bộ nhớ và cookie; mã thiết bị chỉ ổn định trong phiên hiện tại. Lịch sử dùng chung không bị ảnh hưởng.');
+  console.warn('The browser is blocking storage and cookies; the device ID will only remain stable for this session. Shared history is unaffected.');
 } else if (!clientIdentity.fullySynced) {
-  console.warn('Client ID chỉ lưu được ở một cơ chế trình duyệt; đây chỉ là metadata thiết bị, lịch sử dùng chung không bị ảnh hưởng.');
+  console.warn('The client ID could only be stored using one browser mechanism; it is device metadata only, and shared history is unaffected.');
 }
-renderHealthStatus('checking', 'Đang kiểm tra AI', 'Đang kiểm tra trạng thái hệ thống AI.');
+renderHealthStatus('checking', 'Checking AI', 'Checking AI system status.');
 void startCamera();
 
 const loadSecondaryContent = () => {

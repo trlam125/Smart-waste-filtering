@@ -23,119 +23,119 @@ class WasteRule:
 WASTE_RULES: tuple[WasteRule, ...] = (
     WasteRule(
         key="plastic_rigid",
-        display_name="Nhựa cứng",
-        category="Nhựa cứng / chai, hộp nhựa",
-        bin_name="Điểm thu gom nhựa cứng nếu địa phương chấp nhận",
+        display_name="Rigid plastic",
+        category="Rigid plastic / bottles and containers",
+        bin_name="Rigid plastic collection point if accepted locally",
         instruction=(
-            "Áp dụng cho chai, lọ, cốc, khay, hộp hoặc vật nhựa tương đối cứng. "
-            "Làm rỗng, tráng sạch khi cần và để khô trước khi thu gom."
+            "Applies to bottles, jars, cups, trays, containers, and other relatively rigid plastic items. "
+            "Empty the item, rinse it when needed, and let it dry before collection."
         ),
         icon="♻️",
     ),
     WasteRule(
         key="plastic_film",
-        display_name="Nhựa mềm / màng nhựa",
-        category="Túi, màng và bao bì nhựa mềm",
-        bin_name="Điểm thu gom nhựa mềm nếu địa phương có hỗ trợ",
+        display_name="Soft plastic / plastic film",
+        category="Bags, film, and flexible plastic packaging",
+        bin_name="Soft plastic collection point if available locally",
         instruction=(
-            "Áp dụng cho túi nilon, màng bọc, túi PE/PP, gói mềm và bao bì nhựa mỏng. "
-            "Làm rỗng, sạch và khô nếu có thể; ưu tiên điểm thu gom chuyên biệt."
+            "Applies to plastic bags, wrap, PE/PP bags, flexible pouches, and thin plastic packaging. "
+            "Empty, clean, and dry the material when possible; use a specialized collection point when available."
         ),
         icon="🛍️",
     ),
     WasteRule(
         key="paper",
-        display_name="Giấy",
-        category="Giấy tái chế",
-        bin_name="Thùng/điểm giấy tái chế nếu địa phương chấp nhận",
+        display_name="Paper",
+        category="Recyclable paper",
+        bin_name="Paper recycling bin or collection point if accepted locally",
         instruction=(
-            "Giữ giấy sạch và khô. Giấy dính nhiều dầu, thức ăn, phủ sáp hoặc vật liệu ghép "
-            "nhiều lớp có thể cần xử lý theo quy định địa phương."
+            "Keep paper clean and dry. Paper heavily contaminated with oil or food, wax-coated paper, or laminated "
+            "multi-layer materials may require disposal according to local rules."
         ),
         icon="📄",
     ),
     WasteRule(
         key="cardboard",
-        display_name="Bìa carton",
-        category="Bìa carton tái chế",
-        bin_name="Thùng/điểm carton nếu địa phương chấp nhận",
+        display_name="Cardboard",
+        category="Recyclable cardboard",
+        bin_name="Cardboard recycling bin or collection point if accepted locally",
         instruction=(
-            "Làm sạch, giữ khô và gấp phẳng hộp carton để giảm thể tích trước khi thu gom. "
-            "Carton dính nhiều dầu hoặc thức ăn có thể không phù hợp để tái chế."
+            "Clean and keep cardboard dry, then flatten boxes to reduce volume before collection. "
+            "Cardboard heavily contaminated with oil or food may not be suitable for recycling."
         ),
         icon="📦",
     ),
     WasteRule(
         key="metal",
-        display_name="Kim loại",
-        category="Kim loại tái chế",
-        bin_name="Thùng/điểm kim loại tái chế nếu địa phương chấp nhận",
+        display_name="Metal",
+        category="Recyclable metal",
+        bin_name="Metal recycling bin or collection point if accepted locally",
         instruction=(
-            "Làm rỗng và vệ sinh lon/hộp kim loại thông thường. Bình xịt, hộp hóa chất hoặc "
-            "vật chứa nguy hiểm cần theo hướng dẫn thu gom riêng."
+            "Empty and clean ordinary metal cans and containers. Aerosol cans, chemical containers, or "
+            "hazardous containers require separate collection guidance."
         ),
         icon="🥫",
     ),
     WasteRule(
         key="glass",
-        display_name="Thủy tinh",
-        category="Thủy tinh tái chế",
-        bin_name="Thùng/điểm thủy tinh nếu địa phương chấp nhận",
+        display_name="Glass",
+        category="Recyclable glass",
+        bin_name="Glass recycling bin or collection point if accepted locally",
         instruction=(
-            "Chai/lọ thủy tinh sạch có thể được thu gom tái chế tùy địa phương. Không tự động "
-            "trộn gương, gốm sứ, bóng đèn hoặc thủy tinh chịu nhiệt vào cùng luồng."
+            "Clean glass bottles and jars may be recyclable depending on local rules. Do not automatically "
+            "mix mirrors, ceramics, light bulbs, or heat-resistant glass into the same recycling stream."
         ),
         icon="🍾",
     ),
     WasteRule(
         key="organic",
-        display_name="Rác hữu cơ",
-        category="Rác hữu cơ",
-        bin_name="Thùng rác hữu cơ",
-        instruction="Loại bỏ bao bì và bỏ phần thức ăn, vỏ rau quả vào luồng rác hữu cơ/ủ compost nếu có.",
+        display_name="Organic waste",
+        category="Organic waste",
+        bin_name="Organic waste bin",
+        instruction="Remove packaging and place food scraps and fruit or vegetable peels in the organic waste or compost stream if available.",
         icon="🍌",
     ),
     WasteRule(
         key="hazardous",
-        display_name="Rác nguy hại",
-        category="Rác nguy hại",
-        bin_name="Điểm thu gom rác nguy hại",
+        display_name="Hazardous waste",
+        category="Hazardous waste",
+        bin_name="Hazardous waste collection point",
         instruction=(
-            "Không bỏ chung với rác sinh hoạt. Pin, bóng đèn, hóa chất, bình xịt hoặc vật nguy hại "
-            "cần được mang đến điểm thu gom chuyên biệt."
+            "Do not mix with household waste. Batteries, light bulbs, chemicals, aerosol cans, and other hazardous items "
+            "should be taken to a specialized collection point."
         ),
         icon="⚠️",
     ),
     WasteRule(
         key="electronic",
-        display_name="Rác điện tử",
-        category="Rác điện tử",
-        bin_name="Điểm thu gom rác điện tử",
+        display_name="Electronic waste",
+        category="Electronic waste",
+        bin_name="Electronic waste collection point",
         instruction=(
-            "Không tự tháo linh kiện nguy hiểm. Mang điện thoại, bo mạch, phụ kiện máy tính và "
-            "thiết bị điện tử đến điểm thu hồi hoặc tái chế điện tử."
+            "Do not dismantle hazardous components yourself. Take phones, circuit boards, computer accessories, and "
+            "electronic devices to an electronics take-back or recycling point."
         ),
         icon="🔌",
     ),
     WasteRule(
         key="textile",
-        display_name="Dệt may / quần áo, giày dép",
-        category="Rác dệt may",
-        bin_name="Điểm thu gom/tái sử dụng dệt may nếu có",
+        display_name="Textiles / clothing and footwear",
+        category="Textile waste",
+        bin_name="Textile reuse or collection point if available",
         instruction=(
-            "Ưu tiên tái sử dụng, quyên góp hoặc điểm thu gom dệt may cho quần áo, vải và giày dép "
-            "còn phù hợp; phần hư hỏng xử lý theo quy định địa phương."
+            "Prioritize reuse, donation, or textile collection points for clothing, fabric, and footwear "
+            "that are still usable; dispose of damaged items according to local rules."
         ),
         icon="👕",
     ),
     WasteRule(
         key="other",
-        display_name="Rác khác",
-        category="Rác còn lại / vật liệu khác",
-        bin_name="Thùng rác thông thường hoặc theo quy định địa phương",
+        display_name="Other waste",
+        category="Residual waste / other materials",
+        bin_name="General waste bin or local designated disposal",
         instruction=(
-            "Dùng cho vật không thuộc 10 nhóm còn lại trong bộ dữ liệu. Nếu vật có thành phần nguy hại "
-            "hoặc quy định thu gom riêng, ưu tiên hướng dẫn của địa phương."
+            "Use for items that do not belong to the other 10 dataset categories. If an item contains hazardous components "
+            "or has special collection requirements, follow local guidance first."
         ),
         icon="🗑️",
     ),
